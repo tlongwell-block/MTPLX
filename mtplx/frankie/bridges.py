@@ -1,7 +1,7 @@
 """Frankie trained ear adapters, extracted from its reference MLX implementation."""
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 
 class EarBridge(nn.Module):
@@ -16,8 +16,9 @@ class EarBridge(nn.Module):
         self.l2 = nn.Linear(hidden, d_brain)
         self.gate = mx.zeros((1,))
 
-    def __call__(self, x):
-        return self.proj(mx.softmax(self.ctc(x), axis=-1)) + self.gate * self.l2(
+    def __call__(self, x, *, ctc=None):
+        ctc = self.ctc(x) if ctc is None else ctc
+        return self.proj(mx.softmax(ctc, axis=-1)) + self.gate * self.l2(
             nn.gelu(self.l1(self.ln(x)))
         )
 

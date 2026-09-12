@@ -1,6 +1,7 @@
 """Realtime conversation ownership, VAD, cancellation and heard-prefix history."""
 
 from __future__ import annotations
+
 import asyncio
 import base64
 import copy
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from threading import Event
 
 import numpy as np
+
 from .audio import resample
 
 
@@ -41,6 +43,10 @@ class Response:
     item: dict | None = None
     done: bool = False
     settings: dict = field(default_factory=dict)
+    transcripts: list = field(default_factory=list)
+    speech_end_ms: int = 0
+    played_ms: int = 0
+    merged: bool = False
 
 
 class Session:
@@ -87,6 +93,7 @@ class Session:
         self.clock_ms = 0
         self.received_ms = 0.0
         self.speech_id = None
+        self.speech_start_ms = 0
         self.last_speech_ms = 0
         self.metrics = {
             "input_frames": 0,
@@ -169,6 +176,9 @@ class Session:
             )
         run.visible = True
         run.committed_at = time.monotonic()
+        for value in run.transcripts:
+            self.transcribed(*value)
+        run.transcripts.clear()
         audio = "audio" in run.settings["output_modalities"]
         run.item = {
             "id": run.item_id,
@@ -176,9 +186,9 @@ class Session:
             "role": "assistant",
             "status": "in_progress",
             "content": [
-                {"type": "audio", "transcript": ""}
+                {"type": "output_audio", "transcript": ""}
                 if audio
-                else {"type": "text", "text": ""}
+                else {"type": "output_text", "text": ""}
             ],
         }
         self.items.append(run.item)
@@ -206,9 +216,12 @@ class Session:
         run.ready.set()
 
     def emit(self, run, kind, value):
-        while not run.ready.wait(0.01):
-            if run.abort.is_set() or self.closed:
-                return
+        # Transcription must not stall speculative brain prefill. Hold its
+        # event on the event-loop side until the same utterance is committed.
+        if kind != "input_transcript":
+            while not run.ready.wait(0.01):
+                if run.abort.is_set() or self.closed:
+                    return
         if run.abort.is_set() or self.closed:
             return
         if kind == "audio":
@@ -219,6 +232,12 @@ class Session:
 
     def publish(self, run, kind, value):
         if run.abort.is_set() or self.closed:
+            return
+        if kind == "input_transcript":
+            if run.visible:
+                self.transcribed(*value)
+            else:
+                run.transcripts.append(value)
             return
         common = {
             "response_id": run.id,
@@ -231,16 +250,47 @@ class Session:
         elif kind == "text":
             run.text += value
             part = run.item["content"][0]
-            part["transcript" if part["type"] == "audio" else "text"] = run.text
+            part["transcript" if part["type"] == "output_audio" else "text"] = run.text
             self.event(
                 "response.output_audio_transcript.delta"
-                if part["type"] == "audio"
+                if part["type"] == "output_audio"
                 else "response.output_text.delta",
                 delta=value,
                 **common,
             )
         elif kind == "chunk":
             run.chunks.append(value)
+
+    def transcribed(self, item, index, transcript):
+        if self.closed or not any(i is item for i in self.items):
+            return
+        part = item["content"][index]
+        if part.get("_transcript_sent"):
+            return
+        part["transcript"] = transcript
+        part["_transcript_sent"] = True
+        self.event(
+            "conversation.item.input_audio_transcription.completed",
+            item_id=item["id"],
+            content_index=index,
+            transcript=transcript,
+        )
+
+    async def transcribe_item(self, item):
+        try:
+            transcripts = await self.loop.run_in_executor(
+                self.executor, lambda: self.engine.prepare_audio(item)
+            )
+            for value in transcripts:
+                self.transcribed(*value)
+        except Exception as exc:  # noqa: BLE001 — report model/backend failures to the client.
+            if not self.closed and any(i is item for i in self.items):
+                self.event(
+                    "conversation.item.input_audio_transcription.failed",
+                    item_id=item["id"],
+                    content_index=0,
+                    error={"type": "transcription_error", "message": str(exc)},
+                )
 
     def start(self, input_item=None, *, tentative=False):
         if (
@@ -249,7 +299,13 @@ class Session:
             and not self.current.abort.is_set()
         ):
             raise ValueError("A response is already active.")
-        run = Response(input=input_item, settings=copy.deepcopy(self.settings))
+        if input_item is None and self.items and "_speech_end_ms" in self.items[-1]:
+            input_item = self.items[-1]
+        run = Response(
+            input=input_item,
+            settings=copy.deepcopy(self.settings),
+            speech_end_ms=(input_item or {}).get("_speech_end_ms", self.last_speech_ms),
+        )
         self.current = run
         history = list(self.items) + (
             [input_item]
@@ -279,7 +335,7 @@ class Session:
                     session_id=self.id,
                 ),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — keep backend failures within this response.
             if not run.abort.is_set():
                 import traceback
 
@@ -370,6 +426,11 @@ class Session:
                 **common,
             )
         self.event(
+            "response.content_part.done",
+            part=public(run.item["content"][0]),
+            **common,
+        )
+        self.event(
             "response.output_item.done",
             response_id=run.id,
             output_index=0,
@@ -392,6 +453,33 @@ class Session:
             run.ready.set()
         return run
 
+    def merge_resumed(self, run):
+        if (
+            not run.input
+            or not run.visible
+            or run.merged
+            or (run.done and not run.abort.is_set())
+            or time.monotonic() - run.committed_at >= 0.7
+            or not 0 <= self.speech_start_ms - run.speech_end_ms < 700
+            or run.played_ms >= 700
+        ):
+            return
+        index = next(
+            (i for i, item in enumerate(self.items) if item is run.input), None
+        )
+        if index is None or any(
+            item["type"] in {"function_call", "function_call_output"}
+            for item in self.items[index:]
+        ):
+            return
+        run.merged = True
+        self.frames.insert(0, run.input["content"][0]["_pcm"])
+        removed = {run.input["id"], run.item_id}
+        self.items = [item for item in self.items if item["id"] not in removed]
+        for item_id in removed:
+            self.event("conversation.item.deleted", item_id=item_id)
+        self.event("frankie.input.merged", response_id=run.id)
+
     def discard_spec(self):
         if self.spec is None:
             return
@@ -401,8 +489,8 @@ class Session:
         self.event("frankie.speculation.aborted", response_id=self.spec.id)
         self.spec = None
 
-    def audio_item(self, pcm, *, item_id=None):
-        return {
+    def audio_item(self, pcm, *, item_id=None, speech_end_ms=None):
+        item = {
             "id": item_id or identifier("item"),
             "type": "message",
             "role": "user",
@@ -414,6 +502,9 @@ class Session:
                 }
             ],
         }
+        if speech_end_ms is not None:
+            item["_speech_end_ms"] = speech_end_ms
+        return item
 
     def reset_detectors(self):
         self.vad.reset()
@@ -450,7 +541,7 @@ class Session:
         while len(self.tail) >= hop:
             frame, self.tail = self.tail[:hop], self.tail[hop:]
             played, self.system_tail = self.system_tail[:hop], self.system_tail[hop:]
-            self.clock_ms = int(round(self.received_ms - len(self.tail) * 1000 / rate))
+            self.clock_ms = round(self.received_ms - len(self.tail) * 1000 / rate)
             self.metrics["input_frames"] += 1
             if self.current and self.current.visible and not self.current.done:
                 self.metrics["input_frames_during_output"] += 1
@@ -462,6 +553,7 @@ class Session:
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
                 self.listening = True
+                self.speech_start_ms = self.clock_ms
                 self.frames = list(self.pre)
                 self.silence = 0
                 self.speech_id = identifier("item")
@@ -478,30 +570,18 @@ class Session:
                     if self.spec:
                         self.discard_spec()
                     active = self.current
-                    if (
-                        self.voice_run >= 3
-                        and active
-                        and active.visible
-                        and not active.done
-                        and not active.abort.is_set()
-                        and td.get("interrupt_response", True)
-                    ):
-                        self.cancel()
-                        self.metrics["barge_ins"] += 1
-                        self.event("frankie.playback.clear", response_id=active.id)
-                        # A quick resumed utterance belongs to the same user
-                        # input; remove the speculative reply from history.
+                    if self.voice_run >= 3 and active and active.visible:
                         if (
-                            active.input
-                            and time.monotonic() - active.committed_at < 0.7
+                            not active.done
+                            and not active.abort.is_set()
+                            and td.get("interrupt_response", True)
                         ):
-                            self.frames.insert(0, active.input["content"][0]["_pcm"])
-                            self.items = [
-                                i
-                                for i in self.items
-                                if i["id"] not in {active.input["id"], active.item_id}
-                            ]
-                            self.event("frankie.input.merged", response_id=active.id)
+                            self.cancel()
+                            self.metrics["barge_ins"] += 1
+                            self.event("frankie.playback.clear", response_id=active.id)
+                        # The client may already have cancelled on speech_started.
+                        if active.abort.is_set():
+                            self.merge_resumed(active)
                 else:
                     self.silence += 32
                     can_start = (
@@ -517,7 +597,9 @@ class Session:
                     ):
                         self.start(
                             self.audio_item(
-                                np.concatenate(self.frames), item_id=self.speech_id
+                                np.concatenate(self.frames),
+                                item_id=self.speech_id,
+                                speech_end_ms=self.last_speech_ms,
                             ),
                             tentative=True,
                         )
@@ -538,7 +620,9 @@ class Session:
                             self.spec = None
                         else:
                             item = self.audio_item(
-                                np.concatenate(self.frames), item_id=self.speech_id
+                                np.concatenate(self.frames),
+                                item_id=self.speech_id,
+                                speech_end_ms=self.last_speech_ms,
                             )
                             self.items.append(item)
                             self.event(
@@ -553,6 +637,8 @@ class Session:
                             )
                             if td.get("create_response", True) and can_start:
                                 self.start()
+                            else:
+                                self.spawn(self.transcribe_item(item))
                         self.frames = []
                         self.listening = False
                         self.silence = 0
@@ -693,6 +779,8 @@ class Session:
             self.event(
                 "conversation.item.created", item=public(item), previous_item_id=None
             )
+            if any(p["type"] == "input_audio" for p in item.get("content", [])):
+                self.spawn(self.transcribe_item(item))
         elif kind == "response.create":
             self.start()
         elif kind == "response.cancel":
@@ -717,6 +805,7 @@ class Session:
             self.event(
                 "conversation.item.created", item=public(item), previous_item_id=None
             )
+            self.spawn(self.transcribe_item(item))
         elif kind == "input_audio_buffer.clear":
             self.discard_spec()
             self.manual = []
@@ -727,15 +816,21 @@ class Session:
             self.event("input_audio_buffer.cleared")
         elif kind == "conversation.item.truncate":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)
+            run = self.current
+            if item is None and run and run.merged and run.item_id == event["item_id"]:
+                item = run.item
             if item is None or item.get("role") != "assistant":
                 raise ValueError("Unknown assistant audio item.")
-            run = self.current
             if run and run.item_id == item["id"]:
                 self.cancel()
                 ms = max(0, int(event["audio_end_ms"]))
+                run.played_ms = ms
                 text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= ms)
                 item["content"] = [
-                    {"type": "audio", "transcript": text + " [interrupted by the user]"}
+                    {
+                        "type": "output_audio",
+                        "transcript": text + " [interrupted by the user]",
+                    }
                 ]
                 run.text = text
             self.event(

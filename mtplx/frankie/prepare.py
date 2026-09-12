@@ -7,9 +7,9 @@ memory to obtain the existing speech model's speaker embedding and codec context
 import argparse
 import io
 import json
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 
 
 def conditioning(gguf_path, mouth=None, mouth_type="qwen3_tts"):
@@ -35,20 +35,23 @@ def conditioning(gguf_path, mouth=None, mouth_type="qwen3_tts"):
         temporary.flush()
         expression = GGUFReader(temporary.name)
         data.update({t.name: mx.array(t.data.copy()) for t in expression.tensors})
-    for name in ("vap", "bc"):
-        asset = tensors.get(f"assets.{name}.gguf")
-        if asset is None:
-            continue
-        with tempfile.NamedTemporaryFile(suffix=".gguf") as temporary:
-            temporary.write(asset.data.tobytes())
-            temporary.flush()
-            for tensor in GGUFReader(temporary.name).tensors:
-                values = tensor.data
-                if values.ndim == 3:
-                    values = values.transpose(0, 2, 1)
-                data[name + "." + tensor.name.removeprefix("turn.")] = mx.array(
-                    values.copy()
-                )
+    asset = tensors.get("assets.turn.gguf")
+    if asset is None:
+        raise ValueError(
+            "Repack with a combined VAP-BC turn asset before preparing audio."
+        )
+    with tempfile.NamedTemporaryFile(suffix=".gguf") as temporary:
+        temporary.write(asset.data.tobytes())
+        temporary.flush()
+        turn = GGUFReader(temporary.name)
+        mode = turn.get_field("turn.mode")
+        if mode is None or mode.contents() != "duplex":
+            raise ValueError("Expected a combined VAP-BC turn asset.")
+        for tensor in turn.tensors:
+            values = tensor.data
+            if values.ndim == 3:
+                values = values.transpose(0, 2, 1)
+            data[tensor.name] = mx.array(values.copy())
     pcm, sr = sf.read(
         io.BytesIO(tensors["assets.voice.wav"].data.tobytes()), dtype="float32"
     )
@@ -91,7 +94,7 @@ def conditioning(gguf_path, mouth=None, mouth_type="qwen3_tts"):
 
 
 def quantize(model):
-    import mlx.nn as nn
+    from mlx import nn
 
     nn.quantize(
         model,
@@ -115,8 +118,8 @@ def main():
     a = ap.parse_args()
     import mlx.core as mx
     from mlx.utils import tree_flatten
-    from parakeet_mlx import from_pretrained
     from mlx_audio.tts.utils import load_model
+    from parakeet_mlx import from_pretrained
 
     if a.mouth_type == "breeze":
         from .breeze import load_breeze

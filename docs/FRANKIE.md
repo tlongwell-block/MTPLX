@@ -86,6 +86,15 @@ speaker embedding. It saves conditioning tensors, reference codec tokens, and
 reference text token IDs, never a standalone reference WAV. It imports the
 trained expression directions exactly, including their existing scaling.
 
+Audio preparation requires the combined `assets.turn.gguf` VAP-BC asset. Build
+it with the llama.cpp fork's `convert-turn.py` and include it with `pack.py --turn`.
+The verified source is the MIT `maai-kyoto/vap_bc_en`
+checkpoint, revision `3ff203ce14de279045eb1b145a1dd24caa8f1c9d`, SHA256
+`54e5d19456c0ec7a6fb54ebbbceca837257d827bc86fd7820b0669f961cd11bc`.
+Preparation imports its own VAP objective and BC head under `turn.*`, sharing
+one streaming encoder/attention pass for both probabilities. Keep the
+checkpoint's MIT license and source attribution with the artifact.
+
 ### Breeze mouth
 
 Breeze is a separate audio package using the same brain and endpoint. Supply the
@@ -216,6 +225,7 @@ as well; a protocol test does not measure speakers or microphone echo behavior.
 
 ```sh
 python -m pytest tests/test_committed_features.py tests/test_frankie_session.py \
+  tests/test_frankie_audio.py \
   tests/test_generation_sustained.py tests/test_no_mlx_imports.py \
   tests/test_public_cli.py tests/test_runtime_kpis.py
 python -m build

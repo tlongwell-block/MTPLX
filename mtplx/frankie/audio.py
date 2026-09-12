@@ -1,16 +1,18 @@
 """Existing MLX speech models and Frankie conditioning in the server process."""
 
 from __future__ import annotations
+
 import io
 import json
 import re
-from pathlib import Path
+from itertools import groupby
 from math import gcd
+from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 import soundfile as sf
+from mlx import nn
 from scipy.signal import resample_poly
 
 from .bridges import EarBridge, EarTone
@@ -41,9 +43,9 @@ def _overlap_step(self, x):
 
 class AudioModels:
     def __init__(self, directory):
-        from parakeet_mlx.utils import from_config
         from mlx_audio.tts.models.qwen3_tts import Model, ModelConfig
         from mlx_audio.tts.models.qwen3_tts import speech_tokenizer as codec
+        from parakeet_mlx.utils import from_config
 
         root = Path(directory)
         cfg = json.loads((root / "frankie.json").read_text())
@@ -146,18 +148,28 @@ class AudioModels:
     def make_turn(self):
         from .turn import TurnWorker
 
+        weights = dict(self._weights("turn"))
+        if weights:
+            return TurnWorker(weights, mode="duplex")
         weights = dict(self._weights("vap"))
         return TurnWorker(weights) if weights else None
 
     def hear(self, pcm, rate=24000):
         from parakeet_mlx.audio import get_logmel
+        from parakeet_mlx.tokenizer import decode
 
         audio = resample(pcm, rate, 16000)
         mel = get_logmel(mx.array(audio), self.ear.preprocessor_config)
         frames, _ = self.ear.encoder(mel[None] if mel.ndim == 2 else mel)
-        rows = mx.concatenate([self.bridge(frames[0]), self.tone(frames[0])], axis=0)
-        mx.eval(rows)
-        return rows.astype(mx.bfloat16)
+        ctc = self.bridge.ctc(frames[0])
+        rows = mx.concatenate(
+            [self.bridge(frames[0], ctc=ctc), self.tone(frames[0])], axis=0
+        ).astype(mx.bfloat16)
+        tokens = mx.argmax(ctc, axis=-1)
+        mx.eval(rows, tokens)
+        # Collapse repeats before removing blanks: A, blank, A means "AA".
+        ids = [k for k, _ in groupby(tokens.tolist()) if k < len(self.ear.vocabulary)]
+        return rows, decode(ids, self.ear.vocabulary).strip()
 
     def transcribe(self, pcm, rate=24000):
         from parakeet_mlx.audio import get_logmel

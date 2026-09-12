@@ -13,6 +13,8 @@ import numpy as np
 
 class TurnModel:
     def __init__(self, weights, mode="vap"):
+        if mode not in {"vap", "bc", "duplex"}:
+            raise ValueError("Unsupported turn projection mode.")
         self.w = weights
         self.mode = mode
         self.reset()
@@ -140,7 +142,9 @@ class TurnModel:
             mx.reshape(positions, (1, 1, length), stream=s),
             stream=s,
         )
-        mask = np.arange(length)[None, :] <= (length - n + np.arange(n))[:, None]
+        query_positions = (length - n + np.arange(n))[:, None]
+        positions = np.arange(length)[None, :]
+        mask = (positions <= query_positions) & (positions > query_positions - 200)
         scores = mx.where(
             mx.array(mask)[None],
             mx.add(scores, bias, stream=s),
@@ -198,24 +202,35 @@ class TurnModel:
             ),
             stream=s,
         )
-        name = "vap_head" if self.mode == "vap" else "bc_head"
-        x = mx.add(self.linear(x, name), self.w[name + ".bias"], stream=s)
-        if self.mode == "vap":
-            x = self.linear(mx.softmax(x, axis=-1, stream=s), "now")
-            x = mx.divide(
-                x,
-                mx.add(mx.sum(x, axis=-1, keepdims=True, stream=s), 1e-5, stream=s),
-                stream=s,
+        outputs = []
+        if self.mode != "bc":
+            logits = mx.add(
+                self.linear(x, "vap_head"), self.w["vap_head.bias"], stream=s
             )
-        else:
-            x = mx.sigmoid(x, stream=s)
-        mx.eval(x, self.recurrent, self.cache)
-        return np.asarray(x)[-1].copy()
+            now = self.linear(mx.softmax(logits, axis=-1, stream=s), "now")
+            outputs.append(
+                mx.divide(
+                    now,
+                    mx.add(
+                        mx.sum(now, axis=-1, keepdims=True, stream=s), 1e-5, stream=s
+                    ),
+                    stream=s,
+                )
+            )
+        if self.mode != "vap":
+            logits = mx.add(self.linear(x, "bc_head"), self.w["bc_head.bias"], stream=s)
+            outputs.append(mx.sigmoid(logits, stream=s))
+        mx.eval(outputs, self.recurrent, self.cache)
+        values = [np.asarray(output)[-1].copy() for output in outputs]
+        if self.mode == "duplex":
+            # BC encodes (system, user); expose (user, system, backchannel).
+            values[0] = values[0][::-1]
+        return np.concatenate(values)
 
 
 class TurnWorker:
-    def __init__(self, weights):
-        self.model = TurnModel(weights)
+    def __init__(self, weights, mode="vap"):
+        self.model = TurnModel(weights, mode)
         self.queue = queue.Queue(maxsize=30)
         self.latest = None
         self.failed = False
@@ -239,8 +254,12 @@ class TurnWorker:
                     self.model.reset()
                 probability = self.model.process(*audio)
                 if epoch == self.epoch:
-                    self.latest = (end, float(probability[1]))
-            except Exception as error:
+                    self.latest = (
+                        end,
+                        float(probability[1]),
+                        float(probability[2]) if len(probability) == 3 else 0.0,
+                    )
+            except Exception as error:  # noqa: BLE001 — stop a failed inference worker cleanly.
                 self.failed = True
                 self.latest = None
                 print(f"Turn prediction disabled: {error}", flush=True)

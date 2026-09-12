@@ -1,8 +1,9 @@
 """One inference owner for brain, vision, learned audio input and speech output."""
 
 from __future__ import annotations
-import hashlib
+
 import copy
+import hashlib
 import json
 import re
 import time
@@ -19,6 +20,7 @@ from mtplx.session_bank import SessionBank
 from mtplx.vision import load_vision_tower, vision_spec_for_model_dir
 from mtplx.vision.processing import decode_image, preprocess_images
 from mtplx.vision.splice import VisionSplice
+
 from .audio import AudioModels
 
 
@@ -52,10 +54,24 @@ class Frankie:
         self.bank.clear(session_id=session_id)
         self.audio.set_voice(self.audio._default_voice)
 
-    def prompt(self, items, settings, *, generation_prompt=True):
+    def prepare_audio(self, item):
+        transcripts = []
+        for index, part in enumerate(item.get("content", [])):
+            if part["type"] == "input_audio":
+                if "_rows" not in part:
+                    part["_rows"], part["_transcript"] = self.audio.hear(
+                        part["_pcm"], part.get("_rate", 24000)
+                    )
+                transcripts.append((item, index, part["_transcript"]))
+        return transcripts
+
+    def prompt(self, items, settings, *, generation_prompt=True, emit=None):
         messages = [{"role": "system", "content": settings["instructions"]}]
         media = []
         for item in items:
+            for transcript in self.prepare_audio(item):
+                if emit is not None:
+                    emit("input_transcript", transcript)
             if item["type"] == "function_call_output":
                 messages.append(
                     {
@@ -95,11 +111,7 @@ class Frankie:
                     parts.append(part.get("text", part.get("transcript", "")))
                 elif part["type"] in {"input_audio", "input_image"}:
                     if "_rows" not in part:
-                        part["_rows"] = (
-                            self.audio.hear(part["_pcm"], part.get("_rate", 24000))
-                            if part["type"] == "input_audio"
-                            else self.image(part["_bytes"])
-                        )
+                        part["_rows"] = self.image(part["_bytes"])
                     rows = part["_rows"]
                     marker = f"{{{{frankie_media_{len(media)}}}}}"
                     media.append((marker, rows))
@@ -183,7 +195,13 @@ class Frankie:
 
     def respond(self, items, settings, emit, abort, *, session_id):
         started = time.monotonic()
-        ids, splice = self.prompt(items, settings)
+
+        def check_abort():
+            if abort.is_set():
+                raise InterruptedError("Response cancelled.")
+
+        check_abort()
+        ids, splice = self.prompt(items, settings, emit=emit)
         if len(ids) + settings["max_output_tokens"] > settings.get("context", 131072):
             raise ValueError("Conversation exceeds the configured context limit.")
         text_ids = []
@@ -258,6 +276,7 @@ class Frankie:
 
         def received(tokens, states):
             nonlocal all_text, sent_text, in_thinking, in_tool
+            check_abort()
             for token, state in zip(tokens, states):
                 value = self.tokenizer.decode([token])
                 text_ids.append(token)
@@ -294,6 +313,7 @@ class Frankie:
                 emit("text", all_text[len(sent_text) :])
                 sent_text = all_text
             step_audio()
+            check_abort()
 
         from mtplx.thinking_guard import ThinkingGuardConfig, think_marker_ids
 
@@ -311,22 +331,22 @@ class Frankie:
                 forced_close_ids=(markers[1],),
                 starts_in_think=True,
             )
-        options = dict(
-            thinking_guard=guard,
-            max_tokens=settings["max_output_tokens"],
-            sampler=SamplerConfig(
+        options = {
+            "thinking_guard": guard,
+            "max_tokens": settings["max_output_tokens"],
+            "sampler": SamplerConfig(
                 temperature=settings.get("temperature", 0.7), top_p=0.95, top_k=20
             ),
-            seed=settings.get("seed", 0),
-            stop_token_ids=set(self.tokenizer.eos_token_ids),
-            abort_check=abort.is_set,
-            vision_splice=splice,
-            session_bank=self.bank,
-            session_id=session_id,
-            session_restore_mode="clone",
-            capture_final_state=True,
-            commit_prompt_state_to_bank=True,
-        )
+            "seed": settings.get("seed", 0),
+            "stop_token_ids": set(self.tokenizer.eos_token_ids),
+            "abort_check": abort.is_set,
+            "vision_splice": splice,
+            "session_bank": self.bank,
+            "session_id": session_id,
+            "session_restore_mode": "clone",
+            "capture_final_state": True,
+            "commit_prompt_state_to_bank": True,
+        }
         try:
             with CommittedFeatures(self.runtime, len(ids), received) as features:
                 if self.mtp:
