@@ -10175,6 +10175,9 @@ def generate_mtpk(
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
             if stop_origin is None and _is_stop(primary, stop_token_ids):
                 stop_origin = "primary"
+            # This sampled primary has not entered the target cache yet.
+            # Reuse the final-pending capture path even for a one-token turn.
+            pending_primary = primary
             emit_round(event)
             emit_trace()
             break

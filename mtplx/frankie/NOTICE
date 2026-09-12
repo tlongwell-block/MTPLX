@@ -1,0 +1,9 @@
+Frankie's trained adapter layers and CPU VAD implementation are extracted from
+its reference MLX implementation. Parakeet and Qwen3-TTS inference reuse the
+parakeet-mlx and mlx-audio packages in the same process.
+
+The duplex browser audio worklet is adapted from Block's Buzz realtime demo,
+Copyright Block, Inc., licensed under Apache-2.0. See LICENSE-Buzz.
+
+Powered by MTPLX
+https://github.com/youssofal/MTPLX
