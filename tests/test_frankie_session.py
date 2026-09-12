@@ -206,6 +206,7 @@ def test_client_response_retains_committed_vad_input_for_resume():
 
 
 def test_duplex_turn_worker_keeps_both_heads_and_reset_fence(monkeypatch):
+    import threading
     import time
 
     from mtplx.frankie import turn
@@ -213,8 +214,10 @@ def test_duplex_turn_worker_keeps_both_heads_and_reset_fence(monkeypatch):
     class Model:
         def __init__(self, weights, mode):
             assert mode == "duplex"
+            self.owner = threading.get_ident()
 
         def process(self, user, system):
+            assert threading.get_ident() == self.owner
             return np.array([0.9, 0.1, 0.8])
 
         def reset(self):

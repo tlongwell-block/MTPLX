@@ -230,7 +230,6 @@ class TurnModel:
 
 class TurnWorker:
     def __init__(self, weights, mode="vap"):
-        self.model = TurnModel(weights, mode)
         self.queue = queue.Queue(maxsize=30)
         self.latest = None
         self.failed = False
@@ -239,20 +238,23 @@ class TurnWorker:
         self.epoch = 0
         self.needs_reset = False
         self.thread = threading.Thread(
-            target=self.run, daemon=True, name="frankie-turn"
+            target=self.run, args=(weights, mode), daemon=True, name="frankie-turn"
         )
         self.thread.start()
 
-    def run(self):
+    def run(self, weights, mode):
+        model = None
         while True:
             item = self.queue.get()
             if item is None:
                 return
             end, audio, reset, epoch = item
             try:
+                if model is None:
+                    model = TurnModel(weights, mode)
                 if reset:
-                    self.model.reset()
-                probability = self.model.process(*audio)
+                    model.reset()
+                probability = model.process(*audio)
                 if epoch == self.epoch:
                     self.latest = (
                         end,

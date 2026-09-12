@@ -1,11 +1,12 @@
 """Frankie text-to-speech using mlx-audio's Breeze model and cached depth decoding."""
 
 import json
+import os
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+from mlx import nn
 from mlx_audio.lm.models.base import create_attention_mask
 from mlx_audio.lm.models.cache import KVCache
 from mlx_audio.tts.models.breeze_tts import Model, ModelConfig
@@ -40,6 +41,57 @@ class BreezeModel(Model):
             for _ in range(head.shape[0])
         ]
         self._voice_prefix = None
+        self.context_rows = int(
+            os.environ.get("MTPLX_FRANKIE_BREEZE_CONTEXT_ROWS", "2048")
+        )
+        self.context_words = int(
+            os.environ.get("MTPLX_FRANKIE_SPEECH_CONTEXT_WORDS", "100")
+        )
+        if not 0 <= self.context_words <= 1000:
+            raise ValueError("Breeze speech context must be zero to 1000 words.")
+        if self.context_rows and not 1024 <= self.context_rows <= 8192:
+            raise ValueError("Breeze speech context must be zero or 1024-8192 rows.")
+        self._new_cache = self.backbone_model.make_cache
+        self.backbone_model.make_cache = self._generation_cache
+        self.reset_speech_context()
+
+    def reset_speech_context(self):
+        self._speech_cache = None
+        self._context_words = 0
+        self._continuing = False
+        self._max_frames = 0
+
+    def _generation_cache(self):
+        if not self._continuing:
+            self._speech_cache = self._new_cache()
+            self._context_words = 0
+        return self._speech_cache
+
+    def generate(self, *args, **kwargs):
+        words = len((args[0] if args else kwargs["text"]).split())
+        if self._context_words + words > self.context_words:
+            self.reset_speech_context()
+        self._max_frames = kwargs.get("max_tokens", 750)
+        complete, frames = False, 0
+        try:
+            for result in super().generate(*args, **kwargs):
+                frames += result.token_count
+                yield result
+            complete = 0 < frames < self._max_frames
+        finally:
+            if (
+                not complete
+                or not self.context_rows
+                or not self.context_words
+                or words > self.context_words
+                or self._speech_cache is None
+                or self._speech_cache[0].offset > self.context_rows
+                or sum(s.keys.nbytes + s.values.nbytes for s in self._speech_cache)
+                > 100_000_000
+            ):
+                self.reset_speech_context()
+            else:
+                self._context_words += words
 
     @staticmethod
     def sanitize(weights):
@@ -57,9 +109,24 @@ class BreezeModel(Model):
         target = super()._prompt_embeddings(*args, **kwargs)
         if self._voice_prefix is None:
             raise ValueError("Breeze voice conditioning was not initialized.")
-        return mx.concatenate(
-            [self._voice_prefix[None].astype(target.dtype), target], axis=1
+        cached = 0 if self._speech_cache is None else self._speech_cache[0].offset
+        self._continuing = bool(
+            self.context_rows
+            and self.context_words
+            and cached
+            and cached + target.shape[1] + 1 + self._max_frames <= self.context_rows
         )
+        if self._continuing:
+            eos = mx.full((1, 1, self.num_codebooks), self.config.codebook_eos_token_id)
+            prefix = self.backbone_model.embed_tokens(eos)
+        else:
+            prefix = self._voice_prefix[None].astype(target.dtype)
+        if self.context_rows:
+            print(
+                f"Breeze context: cached={cached if self._continuing else 0} new={prefix.shape[1] + target.shape[1]}",
+                flush=True,
+            )
+        return mx.concatenate([prefix, target], axis=1)
 
     def reference_prefix(self, pcm, transcript):
         ids = self._text_ids(f"[S0]{transcript}")
@@ -142,6 +209,7 @@ class BreezeMouth:
         self.set_voice(self._default_voice)
 
     def set_voice(self, values):
+        self.model.reset_speech_context()
         self.voice = values
         self.model._voice_prefix = values["voice.prefix"]
         self.reference_db = float(values["voice.rms_db"].item())

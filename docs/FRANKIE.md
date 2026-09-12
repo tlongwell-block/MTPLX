@@ -119,6 +119,28 @@ GGUF; otherwise it computes conditioning from the GGUF's reference in memory.
 Eligible linear and embedding weights use 8-bit quantization, while the codec
 retains source precision. Keep the Breeze checkpoint's license with the artifact.
 
+Breeze reuses its acoustic backbone KV cache across completed speech chunks in
+one response. A continuation appends the speech boundary and new text to the
+evaluated history, using mlx-audio's existing generation and streaming codec.
+It does not re-encode or replay previous speech. This needs no model conversion
+and works with packaged and custom voices; Qwen3-TTS keeps its existing behavior.
+
+`MTPLX_FRANKIE_SPEECH_CONTEXT_WORDS` defaults to `100`; set it to `0` to disable
+reuse, or select up to `1000`. `MTPLX_FRANKIE_BREEZE_CONTEXT_ROWS` defaults to
+`2048` and accepts `0` or `1024` through `8192`. Before the word or row capacity
+would be exceeded, generation starts again from the voice reference, reserving
+space for the new chunk's maximum audio length. This periodically refreshes the
+whole history instead of shifting individual KV rows. Completed caches larger
+than 100,000,000 bytes, including allocation padding, are discarded regardless
+of those settings. That limit applies to retained KV arrays, not temporary
+inference buffers or the MLX allocator's reusable pool.
+
+Responses, voice changes, interruptions and incomplete generation clear the
+cache. In a controlled 100-word-context measurement with all Frankie weights
+resident, the longest retained history used 86.5 MB and increased overall peak
+active memory by about 9.9 MB versus independent chunks. These are measurements
+of that workload, not a bound on total server memory.
+
 For a brain finetune, change `brain_source` and run Forge again with that
 checkpoint's MTP head. The currently trained Frankie adapters expect the
 compatible 27B architecture and layer-16 features. A different architecture or

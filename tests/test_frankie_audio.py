@@ -79,6 +79,74 @@ def test_cancelled_queued_response_does_not_prepare_audio():
         engine.respond([], {}, lambda *a: None, abort, session_id="cancelled")
 
 
+@pytest.fixture
+def breeze_context(monkeypatch):
+    from mtplx.frankie.breeze import BreezeModel, Model
+
+    model = BreezeModel.__new__(BreezeModel)
+    model.context_rows = 2048
+    model.context_words = 100
+    model._voice_prefix = mx.zeros((200, 4))
+    model.backbone_model = NS(embed_tokens=lambda ids: mx.zeros((1, 1, 4)))
+    model._new_cache = lambda: [NS(offset=0, keys=NS(nbytes=1), values=NS(nbytes=1))]
+    model.config = NS(codebook_eos_token_id=0)
+    model.num_codebooks = 1
+    model.reset_speech_context()
+    monkeypatch.setattr(
+        Model, "_prompt_embeddings", lambda *a, **kw: mx.zeros((1, 3, 4))
+    )
+
+    def generate(self, *args, **kwargs):
+        prompt = self._prompt_embeddings(*args, **kwargs)
+        cache = self._generation_cache()
+        cache[0].offset += prompt.shape[1] + 40
+        yield NS(token_count=40)
+
+    monkeypatch.setattr(Model, "generate", generate)
+    return model
+
+
+def test_breeze_retained_context_has_word_and_row_limits(breeze_context):
+    model = breeze_context
+    list(model.generate("word " * 60, max_tokens=75))
+    first = model._speech_cache
+    list(model.generate("word " * 40, max_tokens=75))
+    assert model._speech_cache is first
+    assert model._context_words == 100
+    list(model.generate("Next.", max_tokens=75))
+    assert model._speech_cache is not first
+    assert model._context_words == 1
+
+    first = model._speech_cache
+    first[0].offset = model.context_rows - 50
+    list(model.generate("New sentence.", max_tokens=75))
+    assert model._speech_cache is not first
+    assert model._context_words == 2
+
+
+@pytest.mark.parametrize(
+    "case", ["long_text", "long_reference", "large_cache", "disabled", "cancel"]
+)
+def test_breeze_discards_unusable_context(breeze_context, case):
+    model = breeze_context
+    if case == "long_reference":
+        model._voice_prefix = mx.zeros((2100, 4))
+    if case == "large_cache":
+        model._new_cache = lambda: [
+            NS(offset=0, keys=NS(nbytes=50_000_001), values=NS(nbytes=50_000_000))
+        ]
+    if case == "disabled":
+        model.context_words = 0
+    generator = model.generate("word " * (101 if case == "long_text" else 1))
+    if case == "cancel":
+        next(generator)
+        generator.close()
+    else:
+        assert list(generator)
+    assert model._speech_cache is None
+    assert model._context_words == 0
+
+
 @pytest.mark.parametrize("mtp", [0, 3])
 def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
     from threading import Event
@@ -123,7 +191,10 @@ def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
         eos_token_ids=[0],
         decode=lambda ids: "".join({2: "Hello.", 3: " Next"}[i] for i in ids),
     )
-    engine.audio = NS(speak=speak)
+    context_resets = []
+    engine.audio = NS(
+        speak=speak, reset_speech_context=lambda: context_resets.append(True)
+    )
     engine.prompt = lambda *a, **kw: ([1], None)
     emitted = []
     with pytest.raises(InterruptedError, match="cancelled"):
@@ -136,4 +207,5 @@ def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
         )
     assert emitted.count("audio") == 1
     assert closed == [True]
+    assert len(context_resets) == 2
     assert engine.runtime.model._mtplx_feature_stream is None

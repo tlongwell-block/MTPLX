@@ -154,6 +154,10 @@ class AudioModels:
         weights = dict(self._weights("vap"))
         return TurnWorker(weights) if weights else None
 
+    def reset_speech_context(self):
+        if self.breeze is not None:
+            self.breeze.model.reset_speech_context()
+
     def hear(self, pcm, rate=24000):
         from parakeet_mlx.audio import get_logmel
         from parakeet_mlx.tokenizer import decode

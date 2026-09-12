@@ -201,6 +201,7 @@ class Frankie:
                 raise InterruptedError("Response cancelled.")
 
         check_abort()
+        self.audio.reset_speech_context()
         ids, splice = self.prompt(items, settings, emit=emit)
         if len(ids) + settings["max_output_tokens"] > settings.get("context", 131072):
             raise ValueError("Conversation exceeds the configured context limit.")
@@ -385,3 +386,4 @@ class Frankie:
         finally:
             if speaker is not None:
                 speaker.close()
+            self.audio.reset_speech_context()
