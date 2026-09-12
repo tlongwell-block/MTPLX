@@ -2,7 +2,8 @@
 
 Frankie accepts text, images, and live microphone audio and streams text and
 speech back. One `mtplx frankie` process owns the brain, vision tower, Parakeet
-encoder, learned audio bridges, Qwen3-TTS, expression conditioning, and VAD.
+encoder, learned audio bridges, Qwen3-TTS or Breeze, expression conditioning,
+VAD, and optional learned turn projection.
 There are no model subprocesses or requests to another inference server. The
 browser and an optional agent harness are clients of this process.
 
@@ -85,6 +86,30 @@ speaker embedding. It saves conditioning tensors, reference codec tokens, and
 reference text token IDs, never a standalone reference WAV. It imports the
 trained expression directions exactly, including their existing scaling.
 
+### Breeze mouth
+
+Breeze is a separate audio package using the same brain and endpoint. Supply the
+Breeze source checkpoint, including its `audio_tokenizer/` directory:
+
+```sh
+python -m mtplx.frankie.prepare \
+  --mouth-type breeze --gguf "$frankie_gguf" --ear "$ear_source" \
+  --mouth '/absolute/path/to/breeze-source' \
+  --output "$PWD/models/Frankie-Breeze-audio-q8"
+```
+
+Pass that new folder as `--audio` when starting the server. Keep it separate from
+the Qwen3-TTS package. Breeze receives the generated spoken text through its
+native text encoder; brain hidden states select its emotion instruction. No
+learned hidden-state-to-text bridge supplies the words. Its depth decoder reuses
+the existing MLX layers with an incremental KV cache. Reference WAV uploads and
+launch-time voice overrides work with either mouth.
+
+The preparer preserves cached Breeze voice conditioning when supplied by the
+GGUF; otherwise it computes conditioning from the GGUF's reference in memory.
+Eligible linear and embedding weights use 8-bit quantization, while the codec
+retains source precision. Keep the Breeze checkpoint's license with the artifact.
+
 For a brain finetune, change `brain_source` and run Forge again with that
 checkpoint's MTP head. The currently trained Frankie adapters expect the
 compatible 27B architecture and layer-16 features. A different architecture or
@@ -144,6 +169,12 @@ speech. Clients clear their playback queue on `frankie.playback.clear` and repor
 `conversation.item.truncate` with the amount actually played. History retains only
 completed speech chunks heard before that cutoff. The page uses a 120 ms playback
 buffer and bounds queued speech to reduce interruptions and underruns.
+
+When the package contains VAP weights, learned turn projection also considers
+the microphone and actual speaker playback on the same sample clock. The page
+sends its aligned playback reference alongside microphone frames. VAP runs on
+the CPU and can hold a short pause open; stale predictions cannot stall a turn,
+and 1.5 seconds of silence forces release. Older packages continue using VAD.
 
 A tool-capable harness supplies function schemas in `session.update.tools` and
 consumes function-call items in `response.done`. It executes tools through its

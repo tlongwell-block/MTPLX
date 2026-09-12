@@ -65,6 +65,26 @@ class AudioModels:
             self._weights("ear_tone", exclude={"word_emb"}), strict=True
         )
         mouth_path = root / cfg["mouth"]
+        self.breeze = None
+        codec.DecoderBlockUpsample.step = _overlap_step
+        if cfg.get("mouth_type", "qwen3_tts") == "breeze":
+            from .breeze import BreezeMouth
+
+            self.breeze = BreezeMouth(mouth_path, self.weights)
+            self._default_voice = self.breeze._default_voice
+            mx.eval(
+                self.ear.parameters(),
+                self.bridge.parameters(),
+                self.tone.parameters(),
+                self.weights,
+            )
+            print(
+                "Frankie ear/Breeze loaded in-process; 8-bit linear and embedding weights.",
+                flush=True,
+            )
+            return
+        if cfg.get("mouth_type", "qwen3_tts") != "qwen3_tts":
+            raise ValueError("Unsupported Frankie mouth type.")
         self.qwen = Model(
             ModelConfig.from_dict(json.loads((mouth_path / "config.json").read_text()))
         )
@@ -80,14 +100,13 @@ class AudioModels:
         self.qwen = Model.post_load_hook(self.qwen, mouth_path)
         self._speaker_encoder = self.qwen.extract_speaker_embedding
         self.offset = None
-        self.qwen.extract_speaker_embedding = lambda *a, **k: self.speaker + (
-            self.offset if self.offset is not None else 0
+        self.qwen.extract_speaker_embedding = lambda *a, **k: (
+            self.speaker + (self.offset if self.offset is not None else 0)
         )
         self._default_voice = {
             k: v for k, v in self.weights.items() if k.startswith("voice.")
         }
         self.set_voice(self._default_voice)
-        codec.DecoderBlockUpsample.step = _overlap_step
         original = getattr(
             codec.Qwen3TTSSpeechTokenizerDecoder.streaming_step,
             "_frankie_original",
@@ -124,6 +143,12 @@ class AudioModels:
         vad.load_weights(self._weights("vad"))
         return vad.prepare()
 
+    def make_turn(self):
+        from .turn import TurnWorker
+
+        weights = dict(self._weights("vap"))
+        return TurnWorker(weights) if weights else None
+
     def hear(self, pcm, rate=24000):
         from parakeet_mlx.audio import get_logmel
 
@@ -144,6 +169,8 @@ class AudioModels:
 
     def set_voice(self, values):
         self.voice = values
+        if self.breeze is not None:
+            return self.breeze.set_voice(values)
         self.codes = values["voice.codes"]
         self.speaker = values["voice.speaker"]
         self.reference_db = float(values["voice.rms_db"].item())
@@ -168,6 +195,10 @@ class AudioModels:
             transcript = self.transcribe(pcm)
         if not transcript.strip():
             raise ValueError("Voice reference needs audible speech or its transcript.")
+        if self.breeze is not None:
+            self.breeze.voice_from_pcm(pcm, transcript)
+            self.voice = self.breeze.voice
+            return
         ref = mx.array(pcm)
         codes = self.qwen.speech_tokenizer.encode(ref[None, None])
         speaker = self._speaker_encoder(ref)
@@ -203,6 +234,9 @@ class AudioModels:
         text = re.sub(
             r"\b\d+\b", lambda m: num2words(int(m[0])) if len(m[0]) < 15 else m[0], text
         )
+        if self.breeze is not None:
+            yield from self.breeze.speak(text, states, temperature=temperature)
+            return
         self.offset = self.expression(states) if len(states) else None
         total_square = count = 0
         gain = 1.0

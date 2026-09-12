@@ -73,7 +73,10 @@ class Session:
             },
         }
         self.vad = engine.audio.make_vad()
+        make_turn = getattr(engine.audio, "make_turn", None)
+        self.turn = make_turn() if make_turn else None
         self.tail = np.empty(0, dtype=np.float32)
+        self.system_tail = np.empty(0, dtype=np.float32)
         self.pre = deque(maxlen=10)
         self.frames = []
         self.silence = 0
@@ -412,11 +415,26 @@ class Session:
             ],
         }
 
-    async def receive_audio(self, encoded):
+    def reset_detectors(self):
+        self.vad.reset()
+        self.tail = np.empty(0, dtype=np.float32)
+        self.system_tail = np.empty(0, dtype=np.float32)
+        self.pre.clear()
+        if self.turn is not None:
+            self.turn.reset(self.received_ms)
+
+    async def receive_audio(self, encoded, playback=None):
         raw = base64.b64decode(encoded, validate=True)
         if len(raw) % 2 or len(raw) > 2 * 24000 * 2:
             raise ValueError("Append at most two seconds of PCM16 audio.")
         samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768
+        if playback is not None:
+            played = base64.b64decode(playback, validate=True)
+            if len(played) != len(raw):
+                raise ValueError("Playback PCM must align exactly with microphone PCM.")
+            system = np.frombuffer(played, dtype="<i2").astype(np.float32) / 32768
+        else:
+            system = np.zeros_like(samples)
         td = self.settings["turn_detection"]
         rate = self.settings["input_rate"]
         if td is None:
@@ -428,13 +446,18 @@ class Session:
         self.received_ms += len(samples) * 1000 / rate
         hop = rate * 32 // 1000
         self.tail = np.concatenate([self.tail, samples])
+        self.system_tail = np.concatenate([self.system_tail, system])
         while len(self.tail) >= hop:
             frame, self.tail = self.tail[:hop], self.tail[hop:]
+            played, self.system_tail = self.system_tail[:hop], self.system_tail[hop:]
             self.clock_ms = int(round(self.received_ms - len(self.tail) * 1000 / rate))
             self.metrics["input_frames"] += 1
             if self.current and self.current.visible and not self.current.done:
                 self.metrics["input_frames_during_output"] += 1
-            probability = self.vad(resample(frame, rate, 16000))
+            user_frame = resample(frame, rate, 16000)
+            probability = self.vad(user_frame)
+            if self.turn is not None:
+                self.turn.append(user_frame, resample(played, rate, 16000))
             voiced = probability >= td.get("threshold", 0.5)
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
@@ -498,7 +521,12 @@ class Session:
                             ),
                             tentative=True,
                         )
-                    if self.silence >= max(160, td.get("silence_duration_ms", 320)):
+                    if self.silence >= max(
+                        160, td.get("silence_duration_ms", 320)
+                    ) and (
+                        self.turn is None
+                        or self.turn.release(self.clock_ms, self.silence)
+                    ):
                         self.event(
                             "input_audio_buffer.speech_stopped",
                             audio_end_ms=self.clock_ms,
@@ -596,9 +624,7 @@ class Session:
                     self.executor, lambda: self.engine.warm(new, session_id=self.id)
                 )
             self.settings = new
-            self.vad.reset()
-            self.tail = np.empty(0, dtype=np.float32)
-            self.pre.clear()
+            self.reset_detectors()
             self.event("session.updated", session=self.info())
         elif kind == "conversation.item.create":
             if self.current and not self.current.done:
@@ -675,7 +701,7 @@ class Session:
                 raise ValueError("Response id is not active.")
             self.cancel()
         elif kind == "input_audio_buffer.append":
-            await self.receive_audio(event["audio"])
+            await self.receive_audio(event["audio"], event.get("playback"))
         elif kind == "input_audio_buffer.commit":
             if not self.manual:
                 raise ValueError("Input audio buffer is empty.")
@@ -697,9 +723,7 @@ class Session:
             self.manual_size = 0
             self.frames = []
             self.listening = False
-            self.tail = np.empty(0, dtype=np.float32)
-            self.pre.clear()
-            self.vad.reset()
+            self.reset_detectors()
             self.event("input_audio_buffer.cleared")
         elif kind == "conversation.item.truncate":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)
@@ -743,6 +767,8 @@ class Session:
         self.closed = True
         self.cancel()
         self.discard_spec()
+        if self.turn is not None:
+            await asyncio.to_thread(self.turn.close)
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.loop.run_in_executor(

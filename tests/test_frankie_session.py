@@ -119,6 +119,63 @@ def test_settings_cannot_drop_pending_pcm():
     asyncio.run(setup(check))
 
 
+def test_turn_gate_holds_pause_allows_resume_and_forces_bounded_release():
+    from mtplx.frankie.turn import TurnWorker
+
+    class Turn:
+        failed = False
+        latest = None
+        samples = 0
+        release = TurnWorker.release
+
+        def append(self, user, system):
+            self.samples += len(user)
+            self.latest = (self.samples, 0.1)
+
+        def close(self):
+            pass
+
+    async def check(s):
+        s.turn = Turn()
+
+        async def feed(value, frames):
+            pcm = base64.b64encode(np.full(768, value, dtype="<i2")).decode()
+            for _ in range(frames):
+                await s.receive_audio(pcm)
+                await asyncio.sleep(0)
+
+        await feed(16000, 4)
+        await feed(0, 12)
+        assert s.spec is not None and not s.spec.visible
+        assert s.listening
+        await feed(16000, 3)
+        assert s.spec is None
+        assert s.metrics["speculation_aborts"] == 1
+        await feed(0, 48)
+        assert not s.listening
+        assert s.current.visible
+
+    asyncio.run(setup(check))
+
+
+def test_playback_is_aligned_and_cleared_with_capture():
+    async def check(s):
+        mic = base64.b64encode(np.full(480, 1000, dtype="<i2")).decode()
+        played = base64.b64encode(np.full(480, 2000, dtype="<i2")).decode()
+        with pytest.raises(ValueError, match="align exactly"):
+            await s.receive_audio(mic, "")
+        assert s.received_ms == 0
+        await s.receive_audio(mic, played)
+        assert len(s.tail) == len(s.system_tail) == 480
+        np.testing.assert_allclose(s.system_tail, 2 * s.tail)
+        await s.handle({"type": "input_audio_buffer.clear"})
+        assert len(s.tail) == len(s.system_tail) == 0
+        await s.receive_audio(mic)
+        np.testing.assert_array_equal(s.system_tail, 0)
+
+    asyncio.run(setup(check))
+
+
 def test_duplicate_tool_result_is_rejected():
     async def check(s):
         s.items = [{"id": "call", "type": "function_call", "call_id": "lookup"}]

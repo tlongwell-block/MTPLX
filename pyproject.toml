@@ -104,7 +104,7 @@ include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
 mtplx = ["templates/**/*.jinja", "data/*.npy"]
-"mtplx.frankie" = ["*.html", "*.mjs", "LICENSE-Buzz", "NOTICE"]
+"mtplx.frankie" = ["*.html", "*.mjs", "LICENSE-Buzz", "LICENSE-MaAI", "NOTICE"]
 "mtplx.benchmarks" = ["prompts/*.jsonl"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [

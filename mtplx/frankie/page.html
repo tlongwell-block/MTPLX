@@ -388,6 +388,7 @@
             send({
               type: "input_audio_buffer.append",
               audio: base64(data.pcm),
+              playback: base64(data.playback),
             });
             let peak = 0;
             for (const x of data.pcm) peak = Math.max(peak, Math.abs(x));
