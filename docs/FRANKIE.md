@@ -189,6 +189,16 @@ client is rejected instead of contending for the model.
 
 ## Duplex and agent harnesses
 
+`session.frankie.input_context` advertises optional context for the next user input.
+Send `{"type":"frankie.input_context.update","revision":1,"text":"Current view information"}`
+with an increasing unsigned revision and at most 16 KiB of UTF-8 text. The server
+acknowledges `frankie.input_context.updated` without changing session instructions
+or generating a reply. Speech onset latches the context (first append for manual
+audio); it becomes an `input_text` part before the audio. Changes during speech
+apply to the following turn. Typed user items share this context mechanism, and
+clear/false-start recovery retain undelivered context. Transcription events use
+the audio part's actual content index.
+
 Connect a Realtime client to `ws://127.0.0.1:18870/v1/realtime` with
 `Authorization: Bearer YOUR_TOKEN`. The page uses the equivalent WebSocket
 subprotocol authentication. Audio output is mono PCM16 at 24 kHz; input accepts

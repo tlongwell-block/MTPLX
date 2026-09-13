@@ -55,6 +55,8 @@ class Session:
         self.loop = asyncio.get_running_loop()
         self.id = identifier("sess")
         self.items = []
+        self.latest_context = (0, "")
+        self.capture_context = (0, "")
         self.current = None
         self.spec = None
         self.closed = False
@@ -129,6 +131,7 @@ class Session:
             "type": "realtime",
             "model": "Frankie",
             "object": "realtime.session",
+            "frankie": {"input_context": True},
             "output_modalities": self.settings["output_modalities"],
             "instructions": self.settings["instructions"],
             "max_output_tokens": self.settings["max_output_tokens"],
@@ -288,7 +291,11 @@ class Session:
                 self.event(
                     "conversation.item.input_audio_transcription.failed",
                     item_id=item["id"],
-                    content_index=0,
+                    content_index=next(
+                        i
+                        for i, p in enumerate(item["content"])
+                        if p["type"] == "input_audio"
+                    ),
                     error={"type": "transcription_error", "message": str(exc)},
                 )
 
@@ -473,7 +480,11 @@ class Session:
         ):
             return
         run.merged = True
-        self.frames.insert(0, run.input["content"][0]["_pcm"])
+        self.frames.insert(
+            0,
+            next(p["_pcm"] for p in run.input["content"] if p["type"] == "input_audio"),
+        )
+        self.capture_context = run.input.get("_capture_context", (0, ""))
         removed = {run.input["id"], run.item_id}
         self.items = [item for item in self.items if item["id"] not in removed]
         for item_id in removed:
@@ -502,9 +513,24 @@ class Session:
                 }
             ],
         }
+        self.attach_context(item, self.capture_context)
+        item["_capture_context"] = self.capture_context
         if speech_end_ms is not None:
             item["_speech_end_ms"] = speech_end_ms
         return item
+
+    def next_context(self):
+        revision, text = self.latest_context
+        if any(item.get("_context_revision") == revision for item in self.items):
+            return (0, "")
+        return revision, text
+
+    @staticmethod
+    def attach_context(item, context):
+        revision, text = context
+        if text:
+            item["content"].insert(0, {"type": "input_text", "text": text})
+            item["_context_revision"] = revision
 
     def reset_detectors(self):
         self.vad.reset()
@@ -529,6 +555,8 @@ class Session:
         td = self.settings["turn_detection"]
         rate = self.settings["input_rate"]
         if td is None:
+            if not self.manual_size:
+                self.capture_context = self.next_context()
             self.manual_size += len(samples)
             if self.manual_size > 90 * rate:
                 raise ValueError("Audio input exceeds 90 seconds.")
@@ -553,6 +581,7 @@ class Session:
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
                 self.listening = True
+                self.capture_context = self.next_context()
                 self.speech_start_ms = self.clock_ms
                 self.frames = list(self.pre)
                 self.silence = 0
@@ -641,17 +670,33 @@ class Session:
                                 self.spawn(self.transcribe_item(item))
                         self.frames = []
                         self.listening = False
+                        self.capture_context = (0, "")
                         self.silence = 0
                 if sum(len(x) for x in self.frames) > 90 * rate:
                     self.discard_spec()
                     self.frames = []
                     self.listening = False
+                    self.capture_context = (0, "")
                     raise ValueError("Utterance exceeds 90 seconds.")
             self.pre.append(frame)
 
     async def handle(self, event):
         kind = event["type"]
-        if kind == "session.update":
+        if kind == "frankie.input_context.update":
+            revision, text = event["revision"], event["text"]
+            if (
+                type(revision) is not int
+                or not self.latest_context[0] < revision < 2**64
+                or not isinstance(text, str)
+                or len(text.encode()) > 16384
+            ):
+                raise ValueError("Invalid input context.")
+            self.latest_context = (
+                revision,
+                text.replace("{{frankie_media_", "{{frankie-media_"),
+            )
+            self.event("frankie.input_context.updated", revision=revision)
+        elif kind == "session.update":
             if self.current and not self.current.done:
                 raise ValueError(
                     "Wait for the current response before changing session settings."
@@ -775,6 +820,8 @@ class Session:
                     raise ValueError("Tool result already supplied.")
             else:
                 raise ValueError("Unsupported conversation item type.")
+            if item["type"] == "message" and item["role"] == "user":
+                self.attach_context(item, self.next_context())
             self.items.append(item)
             self.event(
                 "conversation.item.created", item=public(item), previous_item_id=None
@@ -796,6 +843,7 @@ class Session:
             item = self.audio_item(np.concatenate(self.manual))
             self.manual = []
             self.manual_size = 0
+            self.capture_context = (0, "")
             self.items.append(item)
             self.event(
                 "input_audio_buffer.committed",
@@ -812,6 +860,7 @@ class Session:
             self.manual_size = 0
             self.frames = []
             self.listening = False
+            self.capture_context = (0, "")
             self.reset_detectors()
             self.event("input_audio_buffer.cleared")
         elif kind == "conversation.item.truncate":

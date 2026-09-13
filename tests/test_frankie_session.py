@@ -132,6 +132,98 @@ def test_settings_cannot_drop_pending_pcm():
     asyncio.run(setup(check))
 
 
+def test_input_context_is_latched_until_commit_and_shared_with_text():
+    async def check(s):
+        s.settings["turn_detection"] = None
+        pcm = base64.b64encode(np.zeros(2400, dtype="<i2")).decode()
+
+        async def context(revision, text):
+            await s.handle(
+                {
+                    "type": "frankie.input_context.update",
+                    "revision": revision,
+                    "text": text,
+                }
+            )
+
+        await context(1, "View A")
+        assert not s.items
+        await s.receive_audio(pcm)
+        await context(2, "View B")
+        await s.handle({"type": "input_audio_buffer.commit"})
+        first = s.items[-1]
+        assert first["content"][0] == {"type": "input_text", "text": "View A"}
+        assert first["_context_revision"] == 1
+        await asyncio.gather(*s.tasks)
+        assert first["content"][1]["transcript"] == "Hello Frankie."
+        await s.receive_audio(pcm)
+        await s.handle({"type": "input_audio_buffer.clear"})
+        assert s.next_context() == (2, "View B")
+        for expected in ["View B", "Question"]:
+            await s.handle(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Question"}],
+                    },
+                }
+            )
+            assert s.items[-1]["content"][0]["text"] == expected
+            assert all(
+                isinstance(part, dict) for part in public(s.items[-1])["content"]
+            )
+        assert len(s.items) == 3
+        assert s.items[0] is first
+        for revision, text in [(2, "stale"), (3, "界" * 6000), (True, "bad")]:
+            with pytest.raises(ValueError):
+                await context(revision, text)
+        assert s.latest_context == (2, "View B")
+        await context(3, "Documentation: {{frankie_media_0}}")
+        await s.receive_audio(pcm)
+        await s.handle({"type": "input_audio_buffer.commit"})
+        assert s.items[-1]["content"][0]["text"] == "Documentation: {{frankie-media_0}}"
+        assert s.items[-1]["content"][1]["type"] == "input_audio"
+        assert s.info()["frankie"]["input_context"] is True
+
+    asyncio.run(setup(check))
+
+
+def test_input_context_false_start_restores_original_capture_only():
+    import time
+
+    async def check(s):
+        s.latest_context = s.capture_context = (1, "View A")
+        original = s.audio_item(np.full(1024, 0.3))
+        run = Response(
+            input=original,
+            visible=True,
+            committed_at=time.monotonic(),
+            speech_end_ms=100,
+        )
+        s.items = [
+            original,
+            {"id": run.item_id, "type": "message", "role": "assistant"},
+        ]
+        s.latest_context = s.capture_context = (2, "View B")
+        s.frames = [np.full(1024, 0.4)]
+        s.speech_start_ms = 200
+        run.abort.set()
+        s.merge_resumed(run)
+        assert s.capture_context == (1, "View A")
+        assert s.latest_context == (2, "View B")
+        assert not s.items
+        merged = s.audio_item(np.concatenate(s.frames))
+        assert merged["content"][0]["text"] == "View A"
+        assert len(merged["content"][1]["_pcm"]) == 2048
+        assert "_context_revision" not in public(merged)
+        s.items.append(merged)
+        assert s.next_context() == (2, "View B")
+
+    asyncio.run(setup(check))
+
+
 @pytest.mark.parametrize("barrier", [None, "pause", "tool", "heard"])
 def test_short_resume_survives_client_cancel_without_crossing_turns(barrier):
     import time
