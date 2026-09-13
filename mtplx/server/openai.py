@@ -63,7 +63,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -190,6 +190,8 @@ from mtplx.server.omlx_bridge import (
     normalize_messages_for_template as omlx_normalize_messages_for_template,
     parse_tool_calls as omlx_parse_tool_calls,
 )
+from mtplx.vision.media import image_bytes_from_url as _image_bytes_from_url
+from .completion_requests import ChatMessage, ChatCompletionRequest, CompletionRequest
 from mtplx.server.omlx_bridge.tool_calling import (
     PYTHONIC_TOOL_CALL_END,
     PYTHONIC_TOOL_CALL_START,
@@ -1402,55 +1404,6 @@ def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-class ChatMessage(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    role: str
-    content: Any = ""
-    name: str | None = None
-    tool_call_id: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
-
-
-class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    model: str | None = None
-    messages: list[ChatMessage] = Field(default_factory=list)
-    max_tokens: int | None = None
-    max_completion_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = Field(
-        default=None, validation_alias=AliasChoices("top_p", "topP")
-    )
-    top_k: int | None = Field(
-        default=None, validation_alias=AliasChoices("top_k", "topK")
-    )
-    presence_penalty: float | None = None
-    frequency_penalty: float | None = None
-    depth: int | None = None
-    draft_block_size: int | None = None
-    gemma_draft_block_size: int | None = None
-    generation_mode: str | None = None
-    seed: int | None = None
-    enable_thinking: bool | None = None
-    reasoning_effort: str | None = None
-    stream: bool = False
-    tools: list[dict[str, Any]] | None = None
-    tool_choice: Any = None
-    parallel_tool_calls: bool | None = None
-    stop: Any = None
-    stream_options: dict[str, Any] | None = None
-    response_format: Any = None
-    metadata: dict[str, Any] | None = None
-    user: str | None = None
-    # Declared so a logprobs request fails loudly (400) instead of being
-    # silently swallowed by extra="allow" — clients were reading absent
-    # logprobs as "model returned none" rather than "server ignored me".
-    logprobs: Any = None
-    top_logprobs: int | None = None
-
-
 @dataclass
 class AgentTranscriptCanonicalization:
     raw_message_chars: int = 0
@@ -1689,31 +1642,6 @@ class FanModeRequest(BaseModel):
     mode: str = Field(..., pattern="^(default|smart|max|auto)$")
     require_actual_ramp: bool = False
     timeout_s: float | None = Field(default=None, ge=0.0, le=120.0)
-
-
-class CompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    model: str | None = None
-    prompt: str | list[int] | list[str] | None = None
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    presence_penalty: float | None = None
-    frequency_penalty: float | None = None
-    depth: int | None = None
-    draft_block_size: int | None = None
-    gemma_draft_block_size: int | None = None
-    generation_mode: str | None = None
-    seed: int | None = None
-    stop: Any = None
-    stream: bool = False
-    # Prompt scoring (echo + logprobs + max_tokens 0): one teacher-forced
-    # pass returning per-position top-K logprobs — the lane KL-divergence
-    # harnesses consume. Decode-time logprobs remain unsupported.
-    echo: bool = False
-    logprobs: int | None = None
 
 
 class EmbeddingsRequest(BaseModel):
@@ -4899,8 +4827,6 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-_VISION_IMAGE_FETCH_TIMEOUT_S = 10.0
-_VISION_IMAGE_MAX_BYTES = 50 * 1024 * 1024
 # The Qwen VL families tokenize this literal into
 # vision_start + image_pad + vision_end; the single pad is expanded to
 # the per-image grid count after templating.
@@ -4922,24 +4848,6 @@ def _server_vision_spec(state: Any) -> Any | None:
     return spec
 
 
-def _image_bytes_from_url(url: str) -> bytes:
-    if url.startswith("data:"):
-        header, _, payload = url.partition(",")
-        if not payload or ";base64" not in header:
-            raise ValueError("image data URL must be base64 encoded")
-        raw = base64.b64decode(payload, validate=False)
-    else:
-        if not url.startswith(("http://", "https://")):
-            raise ValueError("image_url must be a data: URL or an http(s) URL")
-        import urllib.request as _urllib_request
-
-        with _urllib_request.urlopen(
-            url, timeout=_VISION_IMAGE_FETCH_TIMEOUT_S
-        ) as response:
-            raw = response.read(_VISION_IMAGE_MAX_BYTES + 1)
-    if len(raw) > _VISION_IMAGE_MAX_BYTES:
-        raise ValueError("image exceeds the 50MB limit")
-    return raw
 
 
 def _vision_extract_and_flatten(

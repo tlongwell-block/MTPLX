@@ -196,3 +196,8 @@ A mention in your repo or on your website does not cover it. The full terms are 
 MTPLX builds on [MLX](https://github.com/ml-explore/mlx) and the Qwen and Gemma model families; the speculative sampling math follows Leviathan and Chen (2023). Fan control via [ThermalForge](https://github.com/ProducerGuy/ThermalForge). Model weights remain governed by their upstream licenses.
 
 Built by [Youssof Altoukhi](https://github.com/youssofal). Bug reports and benchmark replications welcome via [Issues](https://github.com/youssofal/MTPLX/issues).
+
+## Frankie realtime voice
+
+The optional [Frankie server](docs/FRANKIE.md) runs text, vision, live audio input,
+and streamed speech output in one MTPLX process, with MTP and an included web page.
