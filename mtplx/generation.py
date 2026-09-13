@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import contextlib
 import inspect
+import functools
 import json
 import os
 import sys
@@ -6045,6 +6046,21 @@ def _prefill(
     return cache, logits[:, -1, :], hidden, target_forward_time
 
 
+def _drain_steps(fn):
+    """Keep the synchronous API while exposing its request-local work iterator."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        steps = fn(*args, **kwargs)
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+    run.steps = fn
+    return run
+
+
+@_drain_steps
 def _prefill_committed_mtp_history_streaming(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -6277,6 +6293,7 @@ def _prefill_committed_mtp_history_streaming(
                 )
             del boundary_hidden
             _check_postcommit_abort(abort_check)
+            yield {"prefill_tokens": cursor}
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
@@ -6625,6 +6642,7 @@ def generate_ar(
     session_policy_fingerprint: str | None = None,
     capture_final_state: bool = False,
     abort_check: Callable[[], bool] | None = None,
+    vision_splice: Any | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -6673,6 +6691,7 @@ def generate_ar(
     prompt_state = restore_or_prefill_prompt_state(
         rt,
         prompt_ids,
+        vision_splice=vision_splice,
         base_hidden_variant=None,
         mtp_history_policy="cycle",
         session_bank=session_bank,
@@ -7962,6 +7981,7 @@ def generate_mtp1(
     )
 
 
+@_drain_steps
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8017,6 +8037,7 @@ def generate_mtpk(
     vision_splice: Any | None = None,
     constraint: Any | None = None,
     adaptive_width_policy: Any | None = None,
+    _prompt_state: PromptState | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -8431,6 +8452,8 @@ def generate_mtpk(
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
     started_all = time.perf_counter()
+    if _prompt_state is not None:
+        started_all -= _prompt_state.prompt_eval_time_s
     if constraint is not None:
         # The repetition trimmer retracts committed tokens, which would
         # desync the grammar matcher; constrained output is schema-shaped.
@@ -8475,7 +8498,7 @@ def generate_mtpk(
     except (TypeError, ValueError):
         _stable_prefix_len = None
     _prompt_state_started = time.perf_counter()
-    prompt_state = restore_or_prefill_prompt_state(
+    prompt_state = _prompt_state or restore_or_prefill_prompt_state(
         rt,
         prompt_ids,
         vision_splice=vision_splice,
@@ -9992,6 +10015,9 @@ def generate_mtpk(
         if _draft_k20_prescatter_plan is not None:
             _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
     while len(tokens) < max_tokens:
+        # All cache repair and feature callbacks from the previous cycle have
+        # completed before another request can run on this model.
+        yield {"generated_tokens": len(tokens)}
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
             # round 1's totals. Pure bookkeeping — no evaluation forced.

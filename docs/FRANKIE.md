@@ -168,15 +168,30 @@ server's default. To select a server default at launch, add
 If no transcript is supplied, the in-process ear transcribes the reference.
 References must contain 1–30 seconds of speech.
 
-Thinking defaults to off. The API accepts `off`, `minimal`, `low`, `medium`, or
-`high` (also `reasoning.effort: none` for off). Their reasoning budgets are 0,
-64, 256, 1024, and 4096 tokens. `max_output_tokens` limits the entire response;
+Thinking defaults to off. The API accepts `off`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, and `max` (also `reasoning.effort: none` for off). Their reasoning budgets are 0,
+64, 256, 1024, 4096, 16384, and 32768 tokens. These levels set token caps; the
+model's template retains its default reasoning policy. `max_output_tokens` limits the entire response;
 raise it when using a larger thinking budget. The page adjusts this limit to
 leave 512 answer tokens beyond the selected reasoning budget. Reasoning and tool syntax are
 excluded from spoken output. Wait for the current response to finish before
 changing settings.
 
-For a remote Mac, keep the server on loopback and tunnel it:
+Voice and HTTP share brain sampling defaults: thinking uses temperature 1.0,
+top-p .95; non-thinking uses temperature .7, top-p .8. Both use top-k 20,
+min-p 0 and repetition penalty 1. HTTP presence penalty defaults to 0 for thinking
+and 1.5 for non-thinking; voice retains presence penalty 0. HTTP requests accept
+`reasoning_effort` or `enable_thinking`, with explicit sampling overrides taking
+precedence. `presence_penalty` and `frequency_penalty` count generated tokens
+only. Nonzero `min_p` and repetition penalties other than 1 are currently
+rejected instead of silently ignored. Temperature 0 remains available for
+deterministic tests. Mouth sampling is independent of these brain settings.
+
+To serve clients on your LAN, use `--host 0.0.0.0`. Clients use the Mac's LAN
+address with the same port and token: `http://YOUR_MAC:18870/v1` for HTTP APIs
+and `ws://YOUR_MAC:18870/v1/realtime` for Realtime. This host setting applies to
+both APIs in the same process. For the browser demo's microphone, use HTTPS or
+keep the server on loopback and tunnel it:
 
 ```sh
 ssh -N -L 18870:127.0.0.1:18870 user@your-mac
@@ -184,8 +199,8 @@ ssh -N -L 18870:127.0.0.1:18870 user@your-mac
 
 Open the localhost page on the client machine. Browsers permit microphone access
 on localhost or HTTPS. Treat the launch token as private. `/health` reports the
-server PID and MTP depth. Only one active conversation owns inference; a second
-client is rejected instead of contending for the model.
+server PID and MTP depth. Only one active Realtime conversation is accepted;
+HTTP completion requests can run alongside it.
 
 ## Duplex and agent harnesses
 
@@ -311,3 +326,38 @@ command, spoke its result, answered live PCM input, restored tool history, and
 recalled the result after changing the thinking level. A real-model edge probe
 also covered one-, two-, and four-token limits, Unicode text, invalid input
 recovery, and exclusive conversation ownership.
+
+## Experimental concurrent completions
+
+The Frankie server also exposes `/v1/chat/completions`, `/v1/completions`, and
+`/v1/models` using the same bearer token as Realtime. Standard OpenAI SDK clients
+can select its base URL. The loaded brain and vision weights are shared with
+voice. The selected `--mtp` depth applies to both voice and HTTP completions.
+HTTP requests keep separate prompt and draft caches and advance one committed
+MTP cycle at a time on the same model worker. With `--mtp 0`, HTTP uses mlx-lm
+autoregressive batching.
+
+`--http-slots` defaults to four (maximum eight), and `--http-ctx-size` defaults
+to 4096 tokens per request, including its output budget. These limits apply to
+HTTP requests, independently of the voice conversation. HTTP caches are created
+on demand and released as requests finish. HTTP caches currently use the
+runtime's ordinary cache precision; this path does not promise Q4 KV.
+
+Chat content uses ordered `text` and `image_url` parts. Image URLs can be inline
+base64 data URLs or HTTP(S) URLs. Downloads happen outside the model worker so
+a slow image host cannot block speech. Each request accepts at most four images,
+12 MiB per image, and an 18 MiB body. Both streamed SSE and non-streamed results
+are supported, including `stream_options.include_usage`. `/v1/completions` is
+the legacy text-prompt endpoint, not an image API.
+
+Realtime images use `conversation.item.create` with a user message and
+`{"type":"input_image","image_url":"data:image/png;base64,..."}` content.
+Supply inline PNG or JPEG data. Both interfaces accept `detail` values `auto`,
+`low`, and `high`; preprocessing uses the model's image budget rather than
+OpenAI-specific resolution tiers. Image and text parts keep their input order.
+
+During overlapping requests, up to 800 ms of speech can be buffered to protect
+playback while text/image prompts advance. The voice-only path keeps its
+existing buffer target. Requests have separate histories, cancellation, and
+samplers. This remains an experimental API subset: unsupported parameters
+return errors, and `/v1/responses` is not implemented.

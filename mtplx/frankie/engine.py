@@ -16,6 +16,7 @@ from mtplx.features import CommittedFeatures
 from mtplx.generation import generate_ar, generate_mtpk
 from mtplx.runtime import load
 from mtplx.sampling import SamplerConfig
+from .sampling import brain_sampler, thinking_guard
 from mtplx.session_bank import SessionBank
 from mtplx.vision import load_vision_tower, vision_spec_for_model_dir
 from mtplx.vision.processing import decode_image, preprocess_images
@@ -244,10 +245,16 @@ class Frankie:
                     if audio_start is not None
                     else 0
                 )
-                if lead >= 0.4:
+                background = getattr(self, "background_step", None)
+                target_lead = 0.8 if background is not None else 0.4
+                if lead >= target_lead:
+                    if background is not None and background(lead):
+                        if not force:
+                            return
+                        continue
                     if not force:
                         return
-                    abort.wait(min(0.02, lead - 0.35))
+                    abort.wait(min(0.02, lead - target_lead + 0.05))
                     continue
                 if speaker is None:
                     if not pending:
@@ -314,30 +321,17 @@ class Frankie:
                 emit("text", all_text[len(sent_text) :])
                 sent_text = all_text
             step_audio()
+            if not mouth_enabled:
+                background = getattr(self, "background_step", None)
+                if background is not None:
+                    background(float("inf"))
             check_abort()
 
-        from mtplx.thinking_guard import ThinkingGuardConfig, think_marker_ids
-
-        markers = think_marker_ids(self.tokenizer)
         thinking = settings.get("thinking", "off")
-        guard = None
-        if markers and thinking != "off":
-            guard = ThinkingGuardConfig(
-                enabled=True,
-                think_open_token=markers[0],
-                think_close_token=markers[1],
-                budget_tokens={"minimal": 64, "low": 256, "medium": 1024, "high": 4096}[
-                    thinking
-                ],
-                forced_close_ids=(markers[1],),
-                starts_in_think=True,
-            )
         options = {
-            "thinking_guard": guard,
+            "thinking_guard": thinking_guard(self.tokenizer, thinking),
             "max_tokens": settings["max_output_tokens"],
-            "sampler": SamplerConfig(
-                temperature=settings.get("temperature", 0.7), top_p=0.95, top_k=20
-            ),
+            "sampler": brain_sampler(settings, realtime=True),
             "seed": settings.get("seed", 0),
             "stop_token_ids": set(self.tokenizer.eos_token_ids),
             "abort_check": abort.is_set,
@@ -346,7 +340,6 @@ class Frankie:
             "session_id": session_id,
             "session_restore_mode": "clone",
             "capture_final_state": True,
-            "commit_prompt_state_to_bank": True,
         }
         try:
             with CommittedFeatures(self.runtime, len(ids), received) as features:
@@ -358,6 +351,7 @@ class Frankie:
                         mtp_history_policy="committed",
                         verify_strategy="capture_commit",
                         token_callback=features.commit,
+                        commit_prompt_state_to_bank=True,
                         **options,
                     )
                 else:

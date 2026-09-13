@@ -602,3 +602,38 @@ def test_manual_commit_transcribes_without_creating_response():
         assert "response.created" not in types
 
     asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("detail", ["auto", "low", "high"])
+def test_standard_realtime_image_item_preserves_detail(detail):
+    async def check(s):
+        url = "data:image/png;base64," + base64.b64encode(b"image fixture").decode()
+        await s.handle({"type": "conversation.item.create", "item": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Describe this."},
+                {"type": "input_image", "image_url": url, "detail": detail},
+            ],
+        }})
+        part = s.items[-1]["content"][1]
+        assert part["_bytes"] == b"image fixture"
+        assert public(s.items[-1])["content"][1] == {
+            "type": "input_image", "image_url": url, "detail": detail,
+        }
+    asyncio.run(setup(check))
+
+
+def test_realtime_invalid_image_does_not_enter_history():
+    async def check(s):
+        for part in (
+            {"image_url": "https://example.com/image.png"},
+            {"image_url": "data:image/png;base64,YQ==", "detail": "invalid"},
+            {"image_url": "data:image/png;base64,???"},
+        ):
+            with pytest.raises(ValueError):
+                await s.handle({"type": "conversation.item.create", "item": {
+                    "type": "message", "role": "user", "content": [
+                        {"type": "input_image", **part},
+                    ],
+                }})
+            assert not s.items
+    asyncio.run(setup(check))

@@ -15,12 +15,16 @@ def add_arguments(parser):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18870)
     parser.add_argument("--mtp", type=int, default=3, choices=range(5))
+    parser.add_argument("--http-slots", type=int, default=4, choices=range(1, 9))
+    parser.add_argument("--http-ctx-size", type=int, default=4096)
     parser.add_argument("--voice", type=Path)
     parser.add_argument("--voice-transcript")
     return parser
 
 
 def serve(args):
+    if not 128 <= args.http_ctx_size <= 131072:
+        raise ValueError("--http-ctx-size must be between 128 and 131072.")
     token = os.environ.get("MTPLX_FRANKIE_TOKEN")
     if not token:
         raise ValueError("Set MTPLX_FRANKIE_TOKEN to a private access token.")
@@ -91,6 +95,9 @@ def serve(args):
         executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(lifespan=lifespan)
+    from .completions import attach_routes
+    attach_routes(app, lambda: engine, executor, token,
+                  slots=args.http_slots, context_tokens=args.http_ctx_size)
 
     @app.get("/health")
     async def health():

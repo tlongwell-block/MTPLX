@@ -230,7 +230,13 @@ def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
         finally:
             closed.append(True)
 
+    import inspect
+    generation_api = module.generate_mtpk if mtp else module.generate_ar
+
     def generate(runtime, ids, *, token_callback, **kwargs):
+        # Keep the mock honest about the public decoder's accepted options.
+        inspect.signature(generation_api).bind(
+            runtime, ids, token_callback=token_callback, **kwargs)
         stream = runtime.model._mtplx_feature_stream
         stream.record(mx.array([[2, 3]]), mx.ones((1, 2, 4)), [NS(offset=3)], 1)
         token_callback([2, 3])

@@ -66,7 +66,6 @@ class Session:
             "instructions": "You are Frankie. Be helpful and concise. Use natural spoken sentences.",
             "output_modalities": ["audio"],
             "max_output_tokens": 512,
-            "temperature": 0.7,
             "thinking": "off",
             "context": 131072,
             "tools": [],
@@ -728,9 +727,11 @@ class Session:
                 thinking = "medium" if settings["enable_thinking"] else "off"
             if thinking == "none":
                 thinking = "off"
-            if thinking not in {"off", "minimal", "low", "medium", "high"}:
+            from .sampling import THINKING_BUDGETS, brain_sampler
+            if thinking not in THINKING_BUDGETS:
                 raise ValueError("Unknown thinking level.")
             new["thinking"] = thinking
+            brain_sampler(new, realtime=True)
             audio = settings.get("audio", {}).get("input", {})
             if "turn_detection" in audio:
                 new["turn_detection"] = audio["turn_detection"]
@@ -771,15 +772,12 @@ class Session:
                     raise ValueError("Invalid message role.")
                 for part in item.get("content", []):
                     if part["type"] == "input_image":
-                        url = part["image_url"]
-                        url = url["url"] if isinstance(url, dict) else url
-                        if not url.startswith("data:image/"):
-                            raise ValueError("Supply image bytes as a data URL.")
-                        part["_bytes"] = base64.b64decode(
-                            url.split(",", 1)[1], validate=True
-                        )
-                        if len(part["_bytes"]) > 12 * 1024**2:
-                            raise ValueError("Image exceeds 12 MiB.")
+                        from mtplx.vision.media import image_bytes_from_url, validate_image_detail
+                        if item["role"] != "user":
+                            raise ValueError("Images belong in user messages.")
+                        validate_image_detail(part.get("detail", "auto"))
+                        part["_bytes"] = image_bytes_from_url(
+                            part["image_url"], max_bytes=12 * 1024**2, inline_only=True)
                     elif part["type"] == "input_audio":
                         data = base64.b64decode(part.pop("audio"), validate=True)
                         if len(data) % 2 or len(data) > 90 * 24000 * 2:
