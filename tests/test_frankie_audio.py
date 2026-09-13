@@ -79,6 +79,62 @@ def test_cancelled_queued_response_does_not_prepare_audio():
         engine.respond([], {}, lambda *a: None, abort, session_id="cancelled")
 
 
+@pytest.mark.parametrize("temperature", [0, 0.9])
+@pytest.mark.parametrize("top_p", [0.8, 1.0])
+@pytest.mark.parametrize("top_k", [0, 20, 50])
+@pytest.mark.parametrize("seed", [3, 19])
+def test_breeze_depth_matches_upstream_decoder(temperature, top_p, top_k, seed):
+    from mlx import nn
+    from mlx_audio.tts.models.breeze_tts.breeze_tts import _DepthModel
+
+    from mtplx.frankie.breeze import BreezeModel, Model, ModelConfig
+
+    # The independent upstream path recomputes the full prefix and samples
+    # scalar tokens; exercise the real attention and sampling math in both paths.
+    mx.random.seed(0)
+    config = ModelConfig(
+        num_codebooks=8,
+        vocab_size=35,
+        depth_decoder_config={
+            "num_codebooks": 8,
+            "vocab_size": 35,
+            "audio_embed_size": 32,
+            "backbone_hidden_size": 32,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "intermediate_size": 64,
+        },
+    )
+    model = BreezeModel.__new__(BreezeModel)
+    model.config, model.vocab_size, model.num_codebooks = config, 32, 8
+    model.depth_heads = [nn.Linear(32, 35, bias=False) for _ in range(7)]
+    depth = _DepthModel(config)
+    model.depth_decoder = NS(
+        model=depth,
+        next_logits=lambda ids, h: model.depth_heads[ids.shape[1] - 2](
+            depth(ids, h)[:, -1]
+        ),
+    )
+    hidden = mx.random.normal((1, 32))
+    mx.eval(hidden, model.depth_heads, depth.parameters())
+    settings = {
+        "unconditional_hidden": None,
+        "cfg_scale": 1,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+    }
+    mx.random.seed(seed)
+    expected = Model._depth_tokens(model, 1, hidden, **settings)
+    mx.random.seed(seed)
+    actual = model._depth_tokens(1, hidden, **settings)
+    assert actual == expected
+    assert len(actual) == 8 and all(0 <= token < 32 for token in actual)
+
+
 @pytest.fixture
 def breeze_context(monkeypatch):
     from mtplx.frankie.breeze import BreezeModel, Model

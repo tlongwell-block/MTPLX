@@ -9,6 +9,7 @@ import numpy as np
 from mlx import nn
 from mlx_audio.lm.models.base import create_attention_mask
 from mlx_audio.lm.models.cache import KVCache
+from mlx_audio.lm.sample_utils import make_sampler
 from mlx_audio.tts.models.breeze_tts import Model, ModelConfig
 
 
@@ -160,9 +161,16 @@ class BreezeModel(Model):
         hidden = conditional_hidden
         if model.backbone_hidden_state_projector is not None:
             hidden = model.backbone_hidden_state_projector(hidden)
-        codes = [first_codebook]
+        # Match upstream's codec-only distribution, but keep depth samples on
+        # the GPU until the frame is complete instead of synchronizing each head.
+        valid = self.vocab_size
+        effective_top_k = min(top_k, valid) if top_k else 0
+        if effective_top_k == valid:
+            effective_top_k = 0
+        sampler = make_sampler(temp=temperature, top_p=top_p, top_k=effective_top_k)
+        codes = [mx.array([first_codebook], dtype=mx.int32)]
         for i, head in enumerate(self.depth_heads):
-            token = mx.array([[codes[-1] + i * model.vocab_size]])
+            token = (codes[-1] + i * model.vocab_size).reshape(1, 1)
             x = model.embed_tokens(token)
             if i == 0:
                 x = mx.concatenate([hidden[:, None], x], axis=1)
@@ -171,10 +179,8 @@ class BreezeModel(Model):
             for layer, state in zip(model.layers, cache):
                 x = layer(x, mask, state)
             logits = self._mask_reserved_codec_logits(head(model.norm(x)[:, -1]))
-            codes.append(
-                self._sample(logits, temperature=temperature, top_p=top_p, top_k=top_k)
-            )
-        return codes
+            codes.append(sampler(nn.log_softmax(logits[..., :valid], axis=-1)))
+        return mx.concatenate(codes).tolist()
 
 
 def load_breeze(directory):
