@@ -875,6 +875,22 @@ def _bank_may_preempt_first_span(session_bank, prompt_ids, span) -> bool:
         return False
 
 
+def _with_request_scope(fn, scope):
+    """Keep request scopes active across cooperative yields and generator close."""
+    if inspect.isgeneratorfunction(fn):
+        @functools.wraps(fn)
+        def steps(*args, **kwargs):
+            with scope(args, kwargs):
+                return (yield from fn(*args, **kwargs))
+        return steps
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with scope(args, kwargs):
+            return fn(*args, **kwargs)
+    return run
+
+
 def _with_ple_first_gather_early(fn):
     """Start the first prefill chunk's PLE gather at request arrival.
 
@@ -885,22 +901,18 @@ def _with_ple_first_gather_early(fn):
     is one contextvar set and a ``None`` yield.
     """
 
-    import functools
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    def scope(args, kwargs):
         rt = args[0] if args else kwargs.get("rt")
         prompt_ids = args[1] if len(args) > 1 else kwargs.get("prompt_ids")
-        with _ple_first_gather_early_scope(
+        return _ple_first_gather_early_scope(
             rt,
             prompt_ids,
             stable_prefix_len=kwargs.get("stable_prefix_len"),
             session_bank=kwargs.get("session_bank"),
             vision_splice=kwargs.get("vision_splice"),
-        ):
-            return fn(*args, **kwargs)
+        )
 
-    return wrapper
+    return _with_request_scope(fn, scope)
 
 
 @contextlib.contextmanager
@@ -1427,6 +1439,19 @@ def _iter_prefill_chunk_spans(
         ],
         mandatory_edges,
     )
+
+
+def _bounded_prefill_spans(spans, step_size):
+    """Recheck a cooperative scheduler's budget at each prefill yield.
+
+    Preserve the original boundaries (including recurrent-state checkpoints)
+    while allowing an active voice producer to request smaller steps.
+    """
+    for start, end in spans:
+        while start < end:
+            stop = min(end, start + max(1, int(step_size())))
+            yield start, stop
+            start = stop
 
 
 def _sustained_prefill_layout() -> str:
@@ -3093,6 +3118,21 @@ def _trim_repeated_suffix(
     return result
 
 
+def _drain_steps(fn):
+    """Keep the synchronous API while exposing its request-local work iterator."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        steps = fn(*args, **kwargs)
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+    run.steps = fn
+    return run
+
+
+@_drain_steps
 def _prefill_restored_prompt_suffix(
     rt: MTPLXRuntime,
     restored: Any,
@@ -3110,6 +3150,8 @@ def _prefill_restored_prompt_suffix(
     vision_splice: Any | None = None,
     stable_prefix_len: int | None = None,
     plan_ids: Sequence[int] | None = None,
+    prefill_chunk_size: int | None = None,
+    prefill_step_size: Callable[[], int] | None = None,
 ) -> tuple[Any, Any, float, float]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
 
@@ -3307,6 +3349,8 @@ def _prefill_restored_prompt_suffix(
     ):
         _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
     fused_max = _small_suffix_fused_max()
+    if prefill_step_size is not None:
+        fused_max = min(fused_max, max(1, int(prefill_step_size())))
     if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
@@ -3370,12 +3414,13 @@ def _prefill_restored_prompt_suffix(
             _prefill_spans_with_tail_grid(
                 len(body),
                 tail_interval=_gdn_boundary_tail_interval(),
+                chunk_size=prefill_chunk_size,
                 mandatory_edges=(
                     (_stable_edge_rel,) if _stable_edge_rel is not None else ()
                 ),
             )
             if capture_boundaries
-            else _iter_prefill_chunk_spans(len(body))
+            else _iter_prefill_chunk_spans(len(body), chunk_size=prefill_chunk_size)
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -3388,7 +3433,11 @@ def _prefill_restored_prompt_suffix(
     with _ple_prefill_lookahead_scope(
         rt, *_lookahead_plan(spans or [(0, len(suffix))])
     ):
-        for start, end in spans:
+        work_spans = (
+            _bounded_prefill_spans(spans, prefill_step_size)
+            if prefill_step_size is not None else spans
+        )
+        for start, end in work_spans:
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_embeddings = _suffix_chunk_embeddings(chunk_array)
@@ -3467,6 +3516,7 @@ def _prefill_restored_prompt_suffix(
             del logits_chunk
             target_forward_time += _prefill_chunk_cache_cleanup(rt)
             _check_postcommit_abort(abort_check)
+            yield {"prefill_tokens": cached_tokens + end}
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
@@ -3644,6 +3694,7 @@ def _opencode_compact_tool_history_policy(policy_fingerprint: str | None) -> boo
     )
 
 
+@_drain_steps
 def _restore_near_prefix_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -3664,6 +3715,8 @@ def _restore_near_prefix_prompt_state(
     stable_prefix_len: int | None = None,
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
+    prefill_chunk_size: int | None = None,
+    prefill_step_size: Callable[[], int] | None = None,
 ) -> PromptState | None:
     """matched_ceiling: hard cap on any candidate's matched length.
 
@@ -4026,7 +4079,7 @@ def _restore_near_prefix_prompt_state(
                 1 for token in prompt_ids[:restore_point] if token == pad_id
             )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-            _prefill_restored_prompt_suffix(
+            yield from _prefill_restored_prompt_suffix.steps(
                 rt,
                 restored,
                 suffix,
@@ -4045,6 +4098,8 @@ def _restore_near_prefix_prompt_state(
                 # each suffix chunk's n-gram history from the same tokens the
                 # restored state cache holds.
                 plan_ids=prompt_ids,
+                prefill_chunk_size=prefill_chunk_size,
+                prefill_step_size=prefill_step_size,
             )
         )
         entry.hits += 1
@@ -4398,16 +4453,12 @@ def _with_vision_rope(fn):
     store — ropes vision spans identically. Wrong rope on any one of these
     would poison banked states for later exact restores.
     """
-    import functools
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _vision_rope_scope_for(kwargs.get("vision_splice")):
-            return fn(*args, **kwargs)
-
-    return wrapper
+    return _with_request_scope(
+        fn, lambda args, kwargs: _vision_rope_scope_for(kwargs.get("vision_splice"))
+    )
 
 
+@_drain_steps
 @_with_ple_first_gather_early
 @_with_vision_rope
 def restore_or_prefill_prompt_state(
@@ -4429,6 +4480,8 @@ def restore_or_prefill_prompt_state(
     store_prefix_snapshot: bool | None = None,
     stable_prefix_len: int | None = None,
     capture_hidden: bool | None = None,
+    prefill_chunk_size: int | None = None,
+    prefill_step_size: Callable[[], int] | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
 
@@ -4704,7 +4757,7 @@ def restore_or_prefill_prompt_state(
             else:
                 allow_block_prefix = False
             tried_larger_near_prefix = True
-            near_prompt_state = _restore_near_prefix_prompt_state(
+            near_prompt_state = yield from _restore_near_prefix_prompt_state.steps(
                 rt,
                 prompt_ids,
                 base_hidden_variant=base_hidden_variant,
@@ -4734,6 +4787,8 @@ def restore_or_prefill_prompt_state(
                 # omitting it here left the hottest tool-round path
                 # block-rounding down ~one 256-token block per round.
                 stable_prefix_len=stable_prefix_len,
+                prefill_chunk_size=prefill_chunk_size,
+                prefill_step_size=prefill_step_size,
             )
             if near_prompt_state is not None:
                 return _emit_prefill_complete(near_prompt_state)
@@ -4846,7 +4901,7 @@ def restore_or_prefill_prompt_state(
                     if token == pad_id
                 )
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
-                _prefill_restored_prompt_suffix(
+                yield from _prefill_restored_prompt_suffix.steps(
                     rt,
                     restored,
                     suffix,
@@ -4863,6 +4918,8 @@ def restore_or_prefill_prompt_state(
                     stable_prefix_len=stable_prefix_len,
                     # The whole prompt: see the near-prefix caller above.
                     plan_ids=prompt_ids,
+                    prefill_chunk_size=prefill_chunk_size,
+                    prefill_step_size=prefill_step_size,
                 )
             )
             return _emit_prefill_complete(PromptState(
@@ -4892,7 +4949,7 @@ def restore_or_prefill_prompt_state(
                 restore_served=exact_served,
             ))
 
-        near_prompt_state = _restore_near_prefix_prompt_state(
+        near_prompt_state = yield from _restore_near_prefix_prompt_state.steps(
             rt,
             prompt_ids,
             base_hidden_variant=base_hidden_variant,
@@ -4912,6 +4969,8 @@ def restore_or_prefill_prompt_state(
                 vision_restore_spans[0][0] if vision_restore_spans else None
             ),
             vision_splice=vision_splice,
+            prefill_chunk_size=prefill_chunk_size,
+            prefill_step_size=prefill_step_size,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
@@ -4930,7 +4989,7 @@ def restore_or_prefill_prompt_state(
         else None
     )
     if _mtp_history_uses_committed_cache(mtp_history_policy):
-        if _sustained_prefill_enabled():
+        if _sustained_prefill_enabled() or prefill_step_size is not None:
             (
                 cache,
                 logits,
@@ -4939,7 +4998,7 @@ def restore_or_prefill_prompt_state(
                 target_time,
                 prompt_history_time,
                 mtp_history_position_base,
-            ) = _prefill_committed_mtp_history_streaming(
+            ) = yield from _prefill_committed_mtp_history_streaming.steps(
                 rt,
                 prompt_ids,
                 base_hidden_variant=base_hidden_variant,
@@ -4957,6 +5016,8 @@ def restore_or_prefill_prompt_state(
                 vision_splice=vision_splice,
                 stable_prefix_len=stable_prefix_len,
                 gdn_boundary_sink=gdn_boundary_sink,
+                prefill_chunk_size=prefill_chunk_size,
+                prefill_step_size=prefill_step_size,
             )
             prompt_eval_time = target_time + prompt_history_time
         else:
@@ -6046,20 +6107,6 @@ def _prefill(
     return cache, logits[:, -1, :], hidden, target_forward_time
 
 
-def _drain_steps(fn):
-    """Keep the synchronous API while exposing its request-local work iterator."""
-    @functools.wraps(fn)
-    def run(*args, **kwargs):
-        steps = fn(*args, **kwargs)
-        while True:
-            try:
-                next(steps)
-            except StopIteration as done:
-                return done.value
-    run.steps = fn
-    return run
-
-
 @_drain_steps
 def _prefill_committed_mtp_history_streaming(
     rt: MTPLXRuntime,
@@ -6077,6 +6124,7 @@ def _prefill_committed_mtp_history_streaming(
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
     prefill_chunk_size: int | None = None,
+    prefill_step_size: Callable[[], int] | None = None,
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -6141,7 +6189,12 @@ def _prefill_committed_mtp_history_streaming(
     # forward owns the GPU. The census measures those gathers as 8 host-late
     # stalls totalling 2,313 ms with the GPU fully idle.
     with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
-        for start, end in mtp_streaming_spans:
+        spans = (
+            _bounded_prefill_spans(mtp_streaming_spans, prefill_step_size)
+            if prefill_step_size is not None
+            else mtp_streaming_spans
+        )
+        for start, end in spans:
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_len = end - start

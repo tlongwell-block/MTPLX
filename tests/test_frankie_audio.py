@@ -127,12 +127,26 @@ def test_breeze_depth_matches_upstream_decoder(temperature, top_p, top_k, seed):
         "top_p": top_p,
         "top_k": top_k,
     }
-    mx.random.seed(seed)
-    expected = Model._depth_tokens(model, 1, hidden, **settings)
-    mx.random.seed(seed)
-    actual = model._depth_tokens(1, hidden, **settings)
-    assert actual == expected
-    assert len(actual) == 8 and all(0 <= token < 32 for token in actual)
+    # Reuse the same compiled graph across seeds and sampler specializations,
+    # then return to the original settings as a long-running server would.
+    for call_seed, options in (
+        (seed, settings),
+        (seed + 31, settings),
+        (seed, {**settings, "temperature": 0.6, "top_p": 0.7, "top_k": 5}),
+        (seed + 47, {**settings, "temperature": 0}),
+        (seed, settings),
+    ):
+        mx.random.seed(call_seed)
+        expected = Model._depth_tokens(model, 1, hidden, **options)
+        expected_state = list(mx.random.state)
+        mx.random.seed(call_seed)
+        actual = model._depth_tokens(1, hidden, **options)
+        assert actual == expected
+        assert len(actual) == 8 and all(0 <= token < 32 for token in actual)
+        assert all(
+            mx.array_equal(left, right).item()
+            for left, right in zip(expected_state, mx.random.state)
+        )
 
 
 @pytest.fixture

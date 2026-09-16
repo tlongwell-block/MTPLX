@@ -8,6 +8,8 @@ import json
 import re
 import time
 from collections import deque
+from contextlib import nullcontext
+from itertools import repeat
 from pathlib import Path
 
 import mlx.core as mx
@@ -16,13 +18,13 @@ from mtplx.features import CommittedFeatures
 from mtplx.generation import generate_ar, generate_mtpk
 from mtplx.runtime import load
 from mtplx.sampling import SamplerConfig
-from .sampling import brain_sampler, thinking_guard
 from mtplx.session_bank import SessionBank
 from mtplx.vision import load_vision_tower, vision_spec_for_model_dir
 from mtplx.vision.processing import decode_image, preprocess_images
 from mtplx.vision.splice import VisionSplice
 
 from .audio import AudioModels
+from .sampling import brain_sampler, thinking_guard
 
 
 class Frankie:
@@ -282,10 +284,28 @@ class Frankie:
                 audio_seconds += len(pcm) / 24000
                 emit("audio", pcm)
 
-        def received(tokens, states):
+        def finish_phrase(value):
+            if not mouth_enabled or not speech_ids or in_thinking or in_tool:
+                return False
+            current = self.tokenizer.decode(speech_ids).strip()
+            if value == "<tool_call>" or (
+                value.startswith((" ", "\n"))
+                and (
+                    re.search(r"[.!?]$", current)
+                    or (len(current.split()) >= 4 and re.search(r"[;:,]$", current))
+                    or len(current.split()) >= 16
+                )
+            ):
+                chunk()
+                return True
+            return False
+
+        def received(tokens, states=None):
             nonlocal all_text, sent_text, in_thinking, in_tool
             check_abort()
-            for token, state in zip(tokens, states):
+            for token, state in zip(
+                tokens, states if states is not None else repeat(None)
+            ):
                 value = self.tokenizer.decode([token])
                 text_ids.append(token)
                 if value == "<think>":
@@ -305,16 +325,10 @@ class Frankie:
                     continue
                 if in_tool:
                     continue
-                if speech_ids and value.startswith((" ", "\n")):
-                    current = self.tokenizer.decode(speech_ids).strip()
-                    if (
-                        re.search(r"[.!?]$", current)
-                        or (len(current.split()) >= 4 and re.search(r"[;:,]$", current))
-                        or len(current.split()) >= 16
-                    ):
-                        chunk()
-                speech_ids.append(token)
-                speech_states.append(state)
+                finish_phrase(value)
+                if mouth_enabled:
+                    speech_ids.append(token)
+                    speech_states.append(state)
                 detokenizer.add_token(token)
                 all_text += detokenizer.last_segment
             if all_text != sent_text:
@@ -342,7 +356,25 @@ class Frankie:
             "capture_final_state": True,
         }
         try:
-            with CommittedFeatures(self.runtime, len(ids), received) as features:
+            # Text consumers need committed tokens, but no speech features or
+            # their extra device synchronization and one-forward stream delay.
+            feature_stream = (
+                CommittedFeatures(self.runtime, len(ids), received)
+                if mouth_enabled
+                else nullcontext()
+            )
+            with feature_stream as features:
+                def committed(tokens):
+                    features.commit(tokens)
+                    # A committed next token can finish a fully featured phrase
+                    # before that next token has its own hidden-state row.
+                    if features.emitted < len(features.tokens) and finish_phrase(
+                        self.tokenizer.decode([features.tokens[features.emitted]])
+                    ):
+                        step_audio()
+                        check_abort()
+
+                callback = committed if features is not None else received
                 if self.mtp:
                     result = generate_mtpk(
                         self.runtime,
@@ -350,15 +382,15 @@ class Frankie:
                         speculative_depth=self.mtp,
                         mtp_history_policy="committed",
                         verify_strategy="capture_commit",
-                        token_callback=features.commit,
+                        token_callback=callback,
                         commit_prompt_state_to_bank=True,
                         **options,
                     )
                 else:
                     result = generate_ar(
-                        self.runtime, ids, token_callback=features.commit, **options
+                        self.runtime, ids, token_callback=callback, **options
                     )
-                if not abort.is_set():
+                if features is not None and not abort.is_set():
                     features.flush(final=True)
             if not abort.is_set():
                 detokenizer.finalize()

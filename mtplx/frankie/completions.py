@@ -39,6 +39,8 @@ class Job:
         self.done = False
         self.steps = None
         self.context = None
+        self.prefill_step_size = 64
+        self.cached_tokens = 0
 
     def emit(self, value):
         try:
@@ -206,28 +208,20 @@ class Completions:
         # Use the same prefill, draft/verify, committed-history and cache-repair
         # code as voice. Only the caches and RNG belong to this HTTP request.
         from mtplx.generation import (
-            PromptState, generate_mtpk, _prefill_committed_mtp_history_streaming,
-            _resolve_runtime_base_hidden_variant, _resolve_runtime_mtp_hidden_variant,
-            _resolve_runtime_mtp_position_mode, _vision_rope_scope_for,
+            generate_mtpk, restore_or_prefill_prompt_state, _vision_rope_scope_for,
         )
         runtime = self.engine.runtime
         with _vision_rope_scope_for(job.splice):
-            values = yield from _prefill_committed_mtp_history_streaming.steps(
+            state = yield from restore_or_prefill_prompt_state.steps(
                 runtime, job.ids,
-                base_hidden_variant=_resolve_runtime_base_hidden_variant(runtime, None),
-                mtp_hidden_variant=_resolve_runtime_mtp_hidden_variant(runtime, None),
-                mtp_position_mode=_resolve_runtime_mtp_position_mode(runtime),
+                mtp_history_policy="committed", session_bank=self.engine.bank,
+                restore_mode="clone", session_id=job.id,
+                store_prefix_snapshot=False,
                 abort_check=job.cancelled.is_set, vision_splice=job.splice,
-                prefill_chunk_size=32,
+                prefill_chunk_size=64,
+                prefill_step_size=lambda: job.prefill_step_size,
             )
-            cache, logits, hidden, draft_cache, target_time, history_time, position_base = values
-            state = PromptState(
-                trunk_cache=cache, logits=logits, hidden=hidden,
-                committed_mtp_cache=draft_cache, token_prefix=tuple(job.ids),
-                prompt_eval_time_s=target_time + history_time,
-                prompt_mtp_history_time_s=history_time, mtp_history_policy="committed",
-                mtp_history_position_base=position_base, suffix_tokens=len(job.ids),
-            )
+            job.cached_tokens = state.cached_tokens
             def received(tokens):
                 if job.cancelled.is_set():
                     raise InterruptedError("Completion cancelled.")
@@ -237,6 +231,8 @@ class Completions:
                     self.emit_text(job, job.detokenizer.last_segment)
             result = yield from generate_mtpk.steps(
                 runtime, job.ids, _prompt_state=state,
+                session_bank=self.engine.bank, session_id=job.id,
+                session_restore_mode="clone", commit_prompt_state_to_bank=True,
                 speculative_depth=self.engine.mtp, mtp_history_policy="committed",
                 verify_strategy="capture_commit", max_tokens=job.data["max_tokens"],
                 sampler=brain_sampler(job.data),
@@ -250,6 +246,7 @@ class Completions:
         if os.environ.get("FRANKIE_HTTP_PROFILE"):
             print("http_mtp", json.dumps({"id": job.id, "depth": self.engine.mtp,
                 "prompt_tokens": len(job.ids), "generated_tokens": len(result.tokens),
+                "cached_tokens": job.cached_tokens,
                 "drafted_tokens": result.stats.drafted_tokens,
                 "accepted_drafts": result.stats.accepted_drafts,
                 "prefill_seconds": result.stats.prompt_eval_time_s}), flush=True)
@@ -284,12 +281,22 @@ class Completions:
             job = self.active.pop(uid)
             self.active[uid] = job
             try:
-                # A voice turn needs small prefill slices. While idle, combine
-                # up to four slices without changing the decoder's cycle size.
-                for _ in range(1 if voice else 4):
-                    progress = job.context.run(next, job.steps)
-                    if "prefill_tokens" not in progress:
-                        break
+                # Batch idle prefill efficiently, but return to a small slice
+                # as soon as voice needs the shared inference owner. Yield
+                # after each slice so a new voice turn can start promptly.
+                job.prefill_step_size = 32 if voice else 64
+                # This legacy layout hint is process-global. Restore the voice
+                # owner's value when yielding between independent HTTP jobs.
+                context_key = "MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"
+                previous_context = os.environ.get(context_key)
+                os.environ[context_key] = str(len(job.ids))
+                try:
+                    job.context.run(next, job.steps)
+                finally:
+                    if previous_context is None:
+                        os.environ.pop(context_key, None)
+                    else:
+                        os.environ[context_key] = previous_context
             except StopIteration as done:
                 self.close_mtp_job(job)
                 self.finish(job, done.value)
@@ -339,6 +346,7 @@ class Completions:
         job.done = True
         job.emit({"finish_reason": reason, "message": result,
             "usage": {"prompt_tokens": len(job.ids), "completion_tokens": len(job.tokens),
+                      "prompt_tokens_details": {"cached_tokens": job.cached_tokens},
                       "total_tokens": len(job.ids) + len(job.tokens)}})
         self.jobs.discard(job)
 

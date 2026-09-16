@@ -101,3 +101,47 @@ def test_admission_does_not_inherit_voice_image_context():
         service.insert(job)
         assert vision_rope_state() == ("voice-image", 17)
         assert job.context.run(vision_rope_state) is None
+
+
+def test_prefill_budget_changes_between_cooperative_steps():
+    model = AcceptingTinyMTPModel()
+    runtime = _runtime(model)
+    budget = 256
+    steps = _prefill_committed_mtp_history_streaming.steps(
+        runtime, [0] * 600, prefill_chunk_size=256,
+        prefill_step_size=lambda: budget,
+    )
+    assert next(steps) == {"prefill_tokens": 256}
+    budget = 32
+    assert next(steps) == {"prefill_tokens": 288}
+    assert next(steps) == {"prefill_tokens": 320}
+    budget = 256
+    # Preserve the original boundary, then resume larger idle slices.
+    assert next(steps) == {"prefill_tokens": 512}
+    assert next(steps) == {"prefill_tokens": 599}
+    with pytest.raises(StopIteration):
+        next(steps)
+    assert [call["tokens"] for call in model.calls] == [256, 32, 32, 192, 87, 1]
+
+
+def test_scheduler_rechecks_voice_budget_and_yields_after_one_slice():
+    from threading import Event
+    from types import SimpleNamespace as NS
+
+    from mtplx.frankie.completions import Completions
+
+    observed = []
+    job = NS(cancelled=Event(), prefill_step_size=64, context=contextvars.Context(), ids=[0])
+
+    def steps():
+        while True:
+            observed.append(job.prefill_step_size)
+            yield {"prefill_tokens": len(observed)}
+
+    job.steps = steps()
+    service = Completions.__new__(Completions)
+    service.active = {"request": job}
+    service.pending = []
+    for voice in (False, True, False):
+        service.step_mtp(voice)
+    assert observed == [64, 32, 64]

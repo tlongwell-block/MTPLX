@@ -156,8 +156,27 @@ class BreezeModel(Model):
     ):
         if unconditional_hidden is not None:
             raise ValueError("Frankie uses one unguided Breeze branch.")
+        if getattr(self, "_compiled_depth", None) is None:
+            self._compiled_depth = mx.compile(
+                self._depth_codes, inputs=mx.random.state, outputs=mx.random.state
+            )
+        return self._compiled_depth(
+            mx.array([first_codebook], dtype=mx.int32),
+            conditional_hidden,
+            temperature,
+            top_p,
+            top_k,
+        ).tolist()
+
+    def _depth_codes(self, first_codebook, conditional_hidden, temperature, top_p, top_k):
+        # The whole fixed-size frame can reuse one graph; keep the upstream
+        # sampler's RNG state explicit so compilation does not freeze samples.
         model = self.depth_decoder.model
         cache = [KVCache() for _ in model.layers]
+        # A depth pass spans one frame, including its hidden-state prefix.
+        # Avoid the generic text cache's 256-row allocation at every frame.
+        for state in cache:
+            state.step = self.num_codebooks
         hidden = conditional_hidden
         if model.backbone_hidden_state_projector is not None:
             hidden = model.backbone_hidden_state_projector(hidden)
@@ -168,7 +187,7 @@ class BreezeModel(Model):
         if effective_top_k == valid:
             effective_top_k = 0
         sampler = make_sampler(temp=temperature, top_p=top_p, top_k=effective_top_k)
-        codes = [mx.array([first_codebook], dtype=mx.int32)]
+        codes = [first_codebook]
         for i, head in enumerate(self.depth_heads):
             token = (codes[-1] + i * model.vocab_size).reshape(1, 1)
             x = model.embed_tokens(token)
@@ -180,7 +199,7 @@ class BreezeModel(Model):
                 x = layer(x, mask, state)
             logits = self._mask_reserved_codec_logits(head(model.norm(x)[:, -1]))
             codes.append(sampler(nn.log_softmax(logits[..., :valid], axis=-1)))
-        return mx.concatenate(codes).tolist()
+        return mx.concatenate(codes)
 
 
 def load_breeze(directory):
