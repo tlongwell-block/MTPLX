@@ -58,12 +58,13 @@ function browser() {
   const context = vm.createContext({
     document: { getElementById: get, createElement: element }, window: {},
     performance: { now: () => now },
+    atob: (value) => Buffer.from(value, "base64").toString("binary"),
     setTimeout: (callback) => { timers.set(++timerId, callback); return timerId; },
     clearTimeout: (id) => timers.delete(id),
   });
   vm.runInContext(page + `
     globalThis.api = {
-      onEvent, settings, feedback, end,
+      onEvent, onPlaybackState, settings, feedback, end,
       evidence,
       attach(socket, processor) { ws = socket; node = processor; },
       get active() { return active; },
@@ -303,4 +304,93 @@ test("machine task notices do not appear as spoken assistant messages", async ()
     content: [{ type: "input_text", text: "Cancel that lookup." }],
   } });
   assert.equal(b.get("log").children.length, 1);
+});
+
+const audioDelta = (responseId = "reply", itemId = "item", samples = 3072) => ({
+  type: "response.output_audio.delta", response_id: responseId, item_id: itemId,
+  delta: Buffer.alloc(samples * 2).toString("base64"),
+});
+const deviceEvent = (type, responseId = "reply", itemId = "item") => ({
+  type, playback: {responseId, itemId, playedSamples: 3072},
+});
+
+test("generation completion keeps Speaking until the actual worklet drains", async () => {
+  const b = browser(), p = player();
+  await b.api.onEvent({type: "response.created", response: {id: "reply"}});
+  await b.api.onEvent(audioDelta());
+  await b.api.onEvent({type: "response.output_audio.done", item_id: "item"});
+  await b.api.onEvent({type: "response.done", response: {id: "reply", status: "completed"}});
+  assert.equal(b.api.active, false);
+  assert.equal(b.get("status").textContent, "Speaking");
+  assert.equal(b.get("interaction").textContent, "Listening while speaking");
+  for (const message of b.audio) p.send(message);
+  p.render(128);
+  for (const event of p.events.splice(0)) b.api.onPlaybackState(event);
+  assert.equal(b.get("status").textContent, "Speaking");
+  p.render(3072);
+  for (const event of p.events.splice(0)) b.api.onPlaybackState(event);
+  assert.equal(b.get("status").textContent, "Listening");
+  assert.equal(b.get("interaction").textContent, "Listening");
+});
+
+test("paused queued audio resumes visually and stale controls cannot affect replacement", async () => {
+  const b = browser();
+  await b.api.onEvent({type: "response.created", response: {id: "reply"}});
+  await b.api.onEvent(audioDelta());
+  await b.api.onEvent({type: "response.done", response: {id: "reply", status: "completed"}});
+  await b.api.onEvent({type: "frankie.playback.pause", response_id: "reply"});
+  assert.equal(b.get("status").textContent, "Listening");
+  assert.equal(b.get("interaction").textContent, "Listening");
+  await b.api.onEvent({type: "frankie.playback.resume", response_id: "reply"});
+  assert.equal(b.get("status").textContent, "Speaking");
+  await b.api.onEvent({type: "response.created", response: {id: "new"}});
+  await b.api.onEvent(audioDelta("new", "next"));
+  for (const type of ["finished", "stopped", "paused"]) b.api.onPlaybackState(deviceEvent(type));
+  await b.api.onEvent({type: "frankie.playback.clear", response_id: "reply"});
+  await b.api.onEvent({type: "frankie.playback.pause", response_id: "reply"});
+  assert.equal(b.get("status").textContent, "Speaking");
+  assert.equal(b.get("interaction").textContent, "Listening while speaking");
+  assert.equal(b.api.active, true);
+});
+
+test("clear retires speaking state and late audio cannot visually revive it", async () => {
+  const b = browser();
+  await b.api.onEvent({type: "response.created", response: {id: "reply"}});
+  await b.api.onEvent(audioDelta());
+  await b.api.onEvent({type: "frankie.playback.clear", response_id: "reply"});
+  assert.equal(b.get("status").textContent, "Listening");
+  assert.equal(b.get("interaction").textContent, "Listening");
+  await b.api.onEvent(audioDelta());
+  b.api.onPlaybackState(deviceEvent("position"));
+  assert.equal(b.get("status").textContent, "Listening");
+  await b.api.onEvent({type: "response.done", response: {id: "reply", status: "cancelled"}});
+  assert.equal(b.get("interaction").textContent, "Listening");
+});
+
+test("text-only completion and device drain before response.done keep the correct phase", async () => {
+  const b = browser();
+  await b.api.onEvent({type: "response.created", response: {id: "text"}});
+  await b.api.onEvent({type: "response.done", response: {id: "text", status: "completed"}});
+  assert.equal(b.get("status").textContent, "Listening");
+  await b.api.onEvent({type: "response.created", response: {id: "reply"}});
+  await b.api.onEvent(audioDelta());
+  b.api.onPlaybackState(deviceEvent("finished"));
+  assert.equal(b.get("status").textContent, "Responding");
+  assert.equal(b.get("interaction").textContent, "Listening");
+  await b.api.onEvent({type: "response.done", response: {id: "reply", status: "completed"}});
+  assert.equal(b.get("status").textContent, "Listening");
+});
+
+test("explicit hangup displays Call ended but error cleanup preserves the error", async () => {
+  const b = browser();
+  await b.api.onEvent({type: "response.created", response: {id: "reply"}});
+  await b.api.onEvent(audioDelta());
+  await b.get("stop").onclick();
+  assert.equal(b.get("status").textContent, "Call ended");
+  assert.equal(b.get("interaction").textContent, "Ready when you are");
+  assert.equal(b.api.active, false);
+  const error = browser();
+  error.get("status").textContent = "Connection cannot keep up with live audio.";
+  await error.api.end();
+  assert.equal(error.get("status").textContent, "Connection cannot keep up with live audio.");
 });

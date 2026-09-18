@@ -251,6 +251,7 @@
     const messages = new Map(),
       evidence = [];
     let lastPlayback = null;
+    let playbackState = null, clearedResponseId = null, responseFailed = false;
     let playbackFeedback = false,
       lastFeedback = -Infinity;
     const taskRows = new Map();
@@ -355,6 +356,32 @@
     }
     function clearPlayback(responseId) {
       node?.port.postMessage({ type: "clear", requestId: "interrupt", responseId });
+      if (!responseId || responseId === playbackState?.responseId || (!playbackState && responseId === current)) {
+        clearedResponseId = responseId || playbackState?.responseId || current;
+        playbackState = null;
+        lastPlayback = null;
+        updateVoiceActivity();
+      }
+    }
+    function updateVoiceActivity() {
+      status(playbackState ? (playbackState.paused ? "Listening" : "Speaking")
+        : responseFailed ? "Response failed"
+        : active && current !== clearedResponseId ? "Responding" : "Listening");
+      if (playbackState) interaction(playbackState.paused ? "listen" : "continue");
+      else if ($("interaction").textContent === "Listening while speaking") interaction("listen");
+    }
+    function onPlaybackState(data) {
+      const p = data.playback;
+      if (!p || p.responseId !== playbackState?.responseId || p.itemId !== playbackState?.itemId) return;
+      if (data.type === "position" || data.type === "paused") {
+        lastPlayback = p;
+        if (data.type !== "paused") return;
+        playbackState.paused = true;
+      } else if (data.type === "finished" || data.type === "stopped") {
+        playbackState = null;
+        lastPlayback = null;
+      } else return;
+      updateVoiceActivity();
     }
     function interaction(state, reason) {
       const labels = {
@@ -456,6 +483,7 @@
         status("Listening");
         $("send").disabled = false;
         interaction("listen");
+        updateVoiceActivity();
         return;
       }
       if (e.type === "input_audio_buffer.speech_started") {
@@ -464,7 +492,8 @@
         return;
       }
       if (e.type === "frankie.interaction") {
-        interaction(e.state, e.reason);
+        if (e.state === "continue") updateVoiceActivity();
+        else interaction(e.state, e.reason);
         return;
       }
       if (e.type === "frankie.task.updated") {
@@ -478,7 +507,9 @@
       if (e.type === "response.created") {
         active = true;
         current = e.response.id;
-        status("Responding");
+        responseFailed = false;
+        interaction("listen");
+        updateVoiceActivity();
         return;
       }
       if (e.type === "conversation.item.created") {
@@ -534,6 +565,12 @@
       if (e.type === "response.output_audio.delta") {
         const b = Uint8Array.from(atob(e.delta), (c) => c.charCodeAt(0));
         const pcm = new Int16Array(b.buffer);
+        if (pcm.length && e.response_id === current && e.response_id !== clearedResponseId) {
+          if (playbackState?.responseId !== e.response_id || playbackState?.itemId !== e.item_id) {
+            playbackState = { responseId: e.response_id, itemId: e.item_id, paused: false };
+            updateVoiceActivity();
+          }
+        }
         record("audio_received", { itemId: e.item_id, samples: pcm.length });
         node.port.postMessage(
           { type: "audio", responseId: e.response_id, itemId: e.item_id, pcm },
@@ -550,15 +587,17 @@
           type: e.type.endsWith("pause") ? "pause" : "resume",
           responseId: e.response_id,
         });
-        if (e.type.endsWith("pause")) interaction("listen");
+        if (playbackState?.responseId === e.response_id) {
+          playbackState.paused = e.type.endsWith("pause");
+          updateVoiceActivity();
+        }
         return;
       }
       if (e.type === "response.done") {
         if (e.response.id !== current) return;
         active = false;
-        status(
-          e.response.status === "failed" ? "Response failed" : "Listening",
-        );
+        responseFailed = e.response.status === "failed";
+        updateVoiceActivity();
         record("response_status", { responseId: e.response.id, status: e.response.status });
         if (e.response.status === "failed")
           message(
@@ -623,17 +662,18 @@
             $("orb").style.setProperty("--voice-scale", 1 + Math.min(0.18, outputPeak / 32768));
             record("capture", { samples: data.pcm.length });
           } else if (data.type === "position" || data.type === "paused") {
-            lastPlayback = data.playback;
+            onPlaybackState(data);
             record("playback", { ...data.playback });
             // Report the exact held position immediately for heard-prefix
             // rollback; a pause is not an interruption or a truncation.
             if (data.type === "paused") lastFeedback = -Infinity;
             feedback("position", data.playback);
           } else if (data.type === "finished") {
-            lastPlayback = null;
+            onPlaybackState(data);
             record("playback_finished", data.playback);
             feedback("finished", data.playback);
           } else if (data.type === "stopped" && data.playback) {
+            onPlaybackState(data);
             const p = data.playback;
             send({
               type: "conversation.item.truncate",
@@ -692,6 +732,9 @@
       playbackFeedback = false;
       lastFeedback = -Infinity;
       lastPlayback = null;
+      playbackState = null;
+      clearedResponseId = null;
+      responseFailed = false;
       taskRows.clear();
       for (const call of demoCalls.values()) clearTimeout(call.timer);
       demoCalls.clear();
@@ -724,7 +767,10 @@
       $("demoTool").disabled = $("mode").value !== "v5";
       if ($("demoTool").disabled) $("demoTool").checked = false;
     };
-    $("stop").onclick = end;
+    $("stop").onclick = () => {
+      status("Call ended");
+      return end();
+    };
     $("interrupt").onclick = () => {
       send({ type: "response.cancel", response_id: current });
       clearPlayback();
