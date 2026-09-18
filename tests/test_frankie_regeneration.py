@@ -128,7 +128,7 @@ def test_yield_preserves_issued_tool_and_result_arrival_order_without_duplicate_
         assert len(calls) == 1 and calls[0]["call_id"] == "lookup_1"
         pending = [item for item in history if item["type"] == "function_call_output"]
         assert len(pending) == 1 and pending[0]["call_id"] == "lookup_1"
-        assert '"event": "request_issued"' in pending[0]["output"]
+        assert '"pending"' in pending[0]["output"]
         positions = [(index, str(item)) for index, item in enumerate(history)]
         assert next(i for i, text in positions if "answer this first" in text) < next(
             i for i, text in positions if "MATCHED_RESULT" in text)

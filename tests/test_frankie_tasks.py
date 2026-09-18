@@ -69,7 +69,7 @@ def test_projection_preserves_prefix_and_chronological_knowledge_without_mutatio
     pending = project_history(history)
     assert pending[0] == call()
     assert pending[1]["type"] == "function_call_output"
-    assert json.loads(pending[1]["output"]) == {"event": "request_issued"}
+    assert json.loads(pending[1]["output"])["status"] == "pending"
     history.append(result())
     completed = project_history(history)
     assert completed[: len(pending)] == pending

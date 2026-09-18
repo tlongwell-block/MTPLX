@@ -232,7 +232,7 @@ def test_result_before_listener_yield_waits_for_replacement_playback_then_runs_o
         await wait_for(lambda: len(e.calls) == 1)
         replacement = s.current
         assert "DELAYED_RESULT_42" not in str(e.calls[0])
-        assert '"event": "request_issued"' in str(e.calls[0])
+        assert '"pending"' in str(e.calls[0])
         assert s.queued_task_response and s.unhandled_task_results == {"lookup_1"}
         assert not s.task_ledger.tasks["lookup_1"].consumed
         # The result remains at its actual arrival position in wire history.
