@@ -139,11 +139,16 @@ class Frankie:
                         )
                         if transcript.strip():
                             parts.append("Speech transcript (may contain errors): " + transcript)
-            messages.append({"role": "user" if item.get("_task_notice") else item["role"],
-                             "content": "\n".join(parts)})
+            role = "user" if item.get("_task_notice") else item["role"]
+            content = "\n".join(parts)
+            # An unheard/cancelled reply is not an empty assistant example.
+            # Preserve the authoritative item and its playback notice below;
+            # real function calls have their own substantive branch above.
+            if role != "assistant" or content.strip():
+                messages.append({"role": role, "content": content})
             if item.get("_interrupted_draft") is not None:
                 messages.append({"role": "user", "content": draft_notice(
-                    item["_interrupted_draft"])})
+                    item["_interrupted_draft"], has_heard_text=bool(content.strip()))})
         tools = [
             {
                 "type": "function",

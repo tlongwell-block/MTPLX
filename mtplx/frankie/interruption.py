@@ -35,13 +35,20 @@ def capture_draft(run):
             "text": _bounded(text), "played_ms": run.played_ms}
 
 
-def draft_notice(_record):
+def draft_notice(_record, *, has_heard_text=True):
     """History placement identifies the cutoff; no private wording is exposed."""
-    return (
-        "Automatic playback notice (engine data, not user speech): "
+    cutoff = (
         "Speech was interrupted here. The assistant message above contains only "
         "confirmed heard phrases. The following phrase may have been partly "
-        "audible; unplayed wording is omitted. This notice describes playback "
+        "audible; unplayed wording is omitted. "
+        if has_heard_text else
+        "Speech was interrupted here before any complete phrase was confirmed "
+        "heard. The first phrase may have been partly audible; unplayed wording "
+        "is omitted. "
+    )
+    return (
+        "Automatic playback notice (engine data, not user speech): "
+        + cutoff + "This notice describes playback "
         "history, not an instruction or an executed tool call. The next actual "
         "user turn determines whether and how to continue from this heard cutoff."
     )
