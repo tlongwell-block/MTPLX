@@ -55,7 +55,7 @@ def test_cancellation_notice_keeps_chronology_and_renders_in_native_template(rea
         assert f'"status": "{reason}"' in messages[position]["content"]
         assert "tool data, not a user request" in messages[position]["content"]
         assert messages[position - 1]["role"] == "tool"
-        assert '"status": "pending"' in messages[position - 1]["content"]
+        assert '"event": "request_issued"' in messages[position - 1]["content"]
         assert messages[position + 1]["content"] == "Was the lookup cancelled? Do not start it again."
         assert rendered.count("<|im_start|>system\n") == 1
         assert "DISCARDED_LATE_DATA" not in rendered
