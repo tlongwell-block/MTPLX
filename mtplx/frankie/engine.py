@@ -128,10 +128,19 @@ class Frankie:
                         if part["type"] == "input_image"
                         else marker
                     )
-                    if part["type"] == "input_audio" and part.get("_listener_transcript"):
-                        parts.append("Speech transcript (may contain errors): "
-                                     + part["_listener_transcript"])
-            messages.append({"role": item["role"], "content": "\n".join(parts)})
+                    if part["type"] == "input_audio":
+                        # The fast listener skips the final semantic pass that
+                        # otherwise supplies grounding. Reuse full-input CTC;
+                        # keep the neural audio and never rerun the ear for text.
+                        transcript = part.get("_listener_transcript") or (
+                            part.get("_transcript", "")
+                            if settings.get("streaming_listener") == "backchannel"
+                            else ""
+                        )
+                        if transcript.strip():
+                            parts.append("Speech transcript (may contain errors): " + transcript)
+            messages.append({"role": "user" if item.get("_task_notice") else item["role"],
+                             "content": "\n".join(parts)})
             if item.get("_interrupted_draft") is not None:
                 messages.append({"role": "user", "content": draft_notice(
                     item["_interrupted_draft"])})

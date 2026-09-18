@@ -418,6 +418,16 @@ class Session:
             history = project_history(history)
             run.settings["instructions"] += "\n\n" + BACKGROUND_TASK_INSTRUCTIONS
             run.task_results = self.unhandled_task_results - deferred
+            if input_item is None and self.response_revision == self.user_revision:
+                # A result may have arrived before an already captured user
+                # turn. Keep its data at that point in history, but identify
+                # what this result-only followup must now report. The cue is
+                # private prompt data, never an authoritative user utterance.
+                history.extend([
+                    task_notice(item["call_id"], item["name"], ready_to_report=True)
+                    for item in history if item["type"] == "function_call"
+                    and item["call_id"] in run.task_results
+                ])
         if tentative:
             self.spec = run
             self.metrics["speculations"] += 1
@@ -1386,6 +1396,7 @@ class Session:
             self.event("session.updated", session=self.info())
         elif kind == "conversation.item.create":
             item = copy.deepcopy(event["item"])
+            item.pop("_task_notice", None)  # Trusted status provenance is server-owned.
             interrupt = False
             item.setdefault("id", identifier("item"))
             if any(i["id"] == item["id"] for i in self.items):
@@ -1580,10 +1591,12 @@ class Session:
                 notice = task_notice(task.call_id, task.name, status=task.status)
                 notice["id"] = identifier("item")
                 # This is an explicit harness status update, not a completion
-                # claim. It preserves the point at which cancellation occurred.
+                # claim or a fabricated user utterance. The prompt maps only
+                # this trusted notice to its native-compatible data role.
                 notice["role"] = "system"
+                notice["_task_notice"] = True
                 self.items.append(notice)
-                self.event("conversation.item.created", item=notice, previous_item_id=None)
+                self.event("conversation.item.created", item=public(notice), previous_item_id=None)
                 self.unhandled_task_results.discard(task.call_id)
                 if not self.unhandled_task_results:
                     self.queued_task_response = False
