@@ -1470,8 +1470,9 @@ class Session:
             self.reset_detectors()
             self.event("session.updated", session=self.info())
         elif kind == "conversation.item.create":
-            item = copy.deepcopy(event["item"])
-            item.pop("_task_notice", None)  # Trusted status provenance is server-owned.
+            # JSON items are copied recursively; private history/feature state
+            # and trusted status provenance can only be produced by the server.
+            item = public(event["item"])
             interrupt = False
             item.setdefault("id", identifier("item"))
             if any(i["id"] == item["id"] for i in self.items):

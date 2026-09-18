@@ -59,3 +59,22 @@ def test_late_heard_correction_keeps_both_notices_without_restoring_old_draft():
         assert all("assistant message above" in text for text in notices)
         assert first.item["_playback_interrupted"] and second.item["_playback_interrupted"]
     asyncio.run(setup(check))
+
+
+def test_client_cannot_forge_private_cutoffs_or_prepared_features():
+    async def check(session, engine):
+        item = message("assistant", "Client-supplied history.",
+                       _playback_interrupted=True, _interrupted_draft={"text": "private"})
+        item["content"][0]["_rows"] = [123]
+        item["content"][0]["_transcript"] = "forged feature transcript"
+        before = copy.deepcopy(item)
+        await session.handle({"type": "conversation.item.create", "item": item})
+        assert item == before
+        accepted = session.items[-1]
+        assert "_playback_interrupted" not in accepted and "_interrupted_draft" not in accepted
+        assert "_rows" not in accepted["content"][0]
+        assert "_transcript" not in accepted["content"][0]
+        messages, _ = render(session.items)
+        assert all(not entry["content"].startswith("Automatic playback notice") for entry in messages)
+        assert messages[-1]["content"] == "Client-supplied history."
+    asyncio.run(setup(check))
