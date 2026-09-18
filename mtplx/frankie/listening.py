@@ -85,6 +85,13 @@ class PrefixEvidence:
             >= separation_ms * self.snapshot.sample_rate
         )
 
+    def same_transcript(self, other: PrefixEvidence) -> bool:
+        return _words(self.text) == _words(other.text)
+
+    @property
+    def has_words(self) -> bool:
+        return bool(_words(self.text))
+
 
 @dataclass(frozen=True)
 class ListeningDecision:
@@ -145,29 +152,34 @@ class StreamingListener:
     If audio advances while the brain classifies, ``refresh(ticket)`` provides
     a new disposable snapshot for a same-owner ear recheck. ``complete`` accepts
     it only when the *full* recognized transcript is unchanged and no further
-    unreviewed PCM exists. Otherwise retry on newer evidence without controlling
-    playback. A strict policy may miss early opportunities; it cannot silently
-    accept an old decision after a newly recognized negation or qualifier.
+    unreviewed PCM exists. One explicit semantic revalidation can instead use a
+    bounded causal cutoff: classify all refreshed text, then tolerate at most
+    one second of later PCM. This trades semantic lag for reachable interruption
+    during continuous speech; later qualifiers remain possible. The host keeps
+    all input for the eventual answer, and must never label this path current.
     """
     def __init__(self, *, allow_control=False, min_audio_ms=320,
                  interval_ms=320, stability_ms=160, max_partial_probes=3,
                  max_audio_ms=MAX_OBSERVATION_SECONDS * 1000,
-                 max_result_age_ms=2000, clock=time.monotonic):
+                 max_result_age_ms=2000, max_causal_lag_ms=1000, clock=time.monotonic):
         integers = (min_audio_ms, interval_ms, stability_ms, max_partial_probes,
-                    max_audio_ms, max_result_age_ms)
+                    max_audio_ms, max_result_age_ms, max_causal_lag_ms)
         if (type(allow_control) is not bool
                 or any(type(v) is not int or v <= 0 for v in integers)
                 or not stability_ms <= min_audio_ms <= max_audio_ms
-                or max_audio_ms > MAX_OBSERVATION_SECONDS * 1000):
+                or max_audio_ms > MAX_OBSERVATION_SECONDS * 1000
+                or max_causal_lag_ms > 1000):
             raise ValueError("Invalid bounded listener configuration.")
         self.allow_control = allow_control
         self.min_audio_ms, self.interval_ms = min_audio_ms, interval_ms
         self.stability_ms, self.max_partial_probes = stability_ms, max_partial_probes
         self.max_audio_ms, self.max_result_age_ms = max_audio_ms, max_result_age_ms
+        self.max_causal_lag_ms = max_causal_lag_ms
         self.clock = clock
         self._epoch = self._revision = 0
         self._active = False
         self._inflight = self._refresh = None
+        self._revalidation_reserved = False
         self._pcm = bytearray()
         self._reset_input()
 
@@ -249,7 +261,7 @@ class StreamingListener:
         else:
             if (self._samples * 1000 < self.min_audio_ms * self.sample_rate
                     or self._partial_probes >= self.max_partial_probes
-                    or (self._partial_probes and
+                    or (self._last_requested and
                         (self._samples - self._last_requested) * 1000
                         < self.interval_ms * self.sample_rate)):
                 return None
@@ -266,10 +278,21 @@ class StreamingListener:
         self._refresh = self._snapshot(ticket.revision)
         return self._refresh
 
+    def reserve_revalidation(self, ticket: ListeningSnapshot) -> bool:
+        """Charge the optional second classification to the same brain budget."""
+        if (ticket is not self._inflight or not self._active or ticket.epoch != self._epoch
+                or self.exhausted or self._revalidation_reserved
+                or self._partial_probes >= self.max_partial_probes):
+            return False
+        self._partial_probes += 1
+        self._revalidation_reserved = True
+        return True
+
     def retire(self, ticket: ListeningSnapshot):
         """Call once the real owner has relinquished a cancelled/completed job."""
         if ticket is self._inflight:
             self._inflight = self._refresh = None
+            self._revalidation_reserved = False
 
     def cancel(self):
         self._epoch += 1
@@ -278,48 +301,79 @@ class StreamingListener:
         # Do not clear _inflight: only actual owner retirement frees the slot.
 
     def complete(self, ticket: ListeningSnapshot, evidence: PrefixEvidence,
-                 decision: ListeningDecision, *, recheck: PrefixEvidence | None = None) -> ListeningResult:
+                 decision: ListeningDecision, *, recheck: PrefixEvidence | None = None,
+                 revalidated: ListeningDecision | None = None,
+                 semantic_skipped: bool = False) -> ListeningResult:
         """Return a side-effect-free floor recommendation and retire this ticket.
 
         ``apply`` is never a playback pause. The adapter may atomically relinquish
         the matching response's floor, preserving heard prefix + unfinished draft
         and all user audio. It must not start a reply from a partial observation.
         ``backchannel``/``wait`` never pause, clear, or consume the user turn.
+        ``revalidated`` is a second semantic decision about the complete
+        ``recheck`` transcript, not permission to ignore a recognized suffix.
+        It still requires the initial positive's acoustic stability; the second
+        observation may contain a newly growing word. No third validation loop
+        is implied, and additional unclassified PCM is bounded explicitly.
+        A skipped empty/unstable acoustic preflight may refund its reserved
+        semantic probe. Every acoustic request still advances the 320ms minimum
+        interval, and the full six-second PCM budget continues to bound work.
         """
         reason = "eligible"
         latest = recheck or evidence
-        age_ms = (self.clock() - ticket.captured_at) * 1000
+        selected = revalidated or decision
+        age_ms = (self.clock() - (latest.snapshot.captured_at if revalidated else ticket.captured_at)) * 1000
+        age_limit = self.max_causal_lag_ms if revalidated else self.max_result_age_ms
         if (ticket is not self._inflight or not self._active or ticket.epoch != self._epoch):
             reason = "stale_ticket"
         elif evidence.snapshot is not ticket:
             reason = "wrong_evidence"
+        elif semantic_skipped and (
+                type(semantic_skipped) is not bool or recheck is not None or revalidated is not None
+                or self._revalidation_reserved
+                or decision != ListeningDecision("wait")
+                or (evidence.has_words and (ticket.final or evidence.stable(self.stability_ms)))):
+            reason = "invalid_semantic_skip"
+        elif semantic_skipped:
+            if not ticket.final:
+                self._partial_probes -= 1
+            reason = "semantic_skipped"
         elif self.exhausted:
             reason = "audio_budget"
-        elif not math.isfinite(age_ms) or not 0 <= age_ms <= self.max_result_age_ms:
-            reason = "expired"
         elif recheck is not None and recheck.snapshot is not self._refresh:
             reason = "wrong_recheck"
-        elif _words(latest.text) != _words(evidence.text):
+        elif revalidated is not None and (recheck is None or decision.intent != "take_floor"
+                                          or decision.addressed_to_assistant is not True
+                                          or not decision.sufficient_evidence):
+            reason = "invalid_revalidation"
+        elif not math.isfinite(age_ms) or not 0 <= age_ms <= age_limit:
+            reason = "expired"
+        elif revalidated is None and not latest.same_transcript(evidence):
             reason = "changed_transcript"
-        elif latest.snapshot.samples != self._samples:
+        elif revalidated is None and latest.snapshot.samples != self._samples:
             reason = "newer_audio"
-        elif not _words(evidence.text):
+        elif revalidated is not None and (self._samples - latest.snapshot.samples) * 1000 > (
+                self.max_causal_lag_ms * self.sample_rate):
+            reason = "causal_audio_lag"
+        elif not _words(evidence.text) or not _words(latest.text):
             reason = "empty_evidence"
         elif not (evidence.snapshot.final or evidence.stable(self.stability_ms)):
             reason = "unstable_evidence"
-        elif decision.intent != "take_floor":
-            reason = decision.intent
-        elif decision.addressed_to_assistant is not True:
+        elif selected.intent != "take_floor":
+            reason = selected.intent
+        elif selected.addressed_to_assistant is not True:
             reason = "uncertain_addressee"
-        elif not decision.sufficient_evidence:
+        elif not selected.sufficient_evidence:
             reason = "insufficient_evidence"
         eligible = reason == "eligible"
         apply = eligible and self.allow_control
         if apply:
             self._applied = True
+            if revalidated is not None:
+                reason = "causal_cutoff"
         result = ListeningResult(ticket.response_id, ticket.utterance_id, ticket.epoch,
-                                 ticket.revision, latest.snapshot.samples, decision.action,
-                                 decision.intent, reason if not eligible or apply else "observation_only",
+                                 ticket.revision, latest.snapshot.samples, selected.action,
+                                 selected.intent, reason if not eligible or apply else "observation_only",
                                  eligible, apply)
         self.retire(ticket)
         return result

@@ -11,7 +11,8 @@ import pytest
 
 pytest.importorskip("mlx.core")  # Completions.step imports MLX, but these tests run no tensor math.
 from mtplx.frankie.completions import Completions
-from mtplx.frankie.listening import StreamingListener
+from mtplx.frankie.floor import FLOOR_POLICY, REMINDER, parse_floor_decision
+from mtplx.frankie.listening import ListeningDecision, StreamingListener
 from mtplx.frankie.perception import RealtimeListener
 
 
@@ -19,6 +20,15 @@ async def until(predicate):
     async with asyncio.timeout(2):
         while not predicate():
             await asyncio.sleep(.001)
+
+
+def floor_payload(data):
+    messages = data["messages"]
+    assert messages[0] == {"role": "system", "content": FLOOR_POLICY}
+    text = messages[-1]["content"]
+    payload, end = json.JSONDecoder().raw_decode(text)
+    assert text[end:] == REMINDER
+    return payload
 
 
 def snapshot(ms=400, *, final=False, rate=24000):
@@ -51,7 +61,11 @@ class FakeBrain(Completions):
         self.action = "wait"
 
     def prepare(self, job):
-        job.prepare_callback(job)
+        value = job.prepare_callback(job)
+        job.prepare_callback = None
+        job.prepare_seconds = .012
+        if job.cancelled.is_set() or (job.internal and value is not None):
+            return value
         self.prompts.append(copy.deepcopy(job.data))
         job.emit({"listener_prepare_seconds": .012})
 
@@ -59,7 +73,7 @@ class FakeBrain(Completions):
         # Only Qwen's computation is stubbed, not owner scheduling or admission.
         job.done = True
         job.emit({"finish_reason": "stop", "message": {"content": self.action},
-                  "usage": {"completion_tokens": 2}})
+                  "usage": {"completion_tokens": 2, **self.owner_usage(job)}})
         self.jobs.discard(job)
 
 
@@ -89,25 +103,22 @@ def test_prefix_uses_complete_current_ctc_on_actual_single_owner_and_no_history_
         snap = snapshot()
         decision, evidence, stats = await listener.classify_prefix(
             snap, heard_text="Keep explaining the route.", pending_work=True, assistant_name="Frankie")
-        assert decision.action == "wait" and decision.confidence is None
-        assert not hasattr(decision, "addressed_to_assistant")
-        assert not hasattr(decision, "sufficient_evidence")
+        assert decision == ListeningDecision("wait")
+        assert not hasattr(decision, "confidence")
         assert evidence.snapshot is snap and evidence.text == "Stop worrying."
         assert evidence.previous_text == "Stop"
         assert evidence.previous_samples == 240 * 24
         assert not evidence.stable(160)
-        payload = json.loads(service.prompts[0]["messages"][-1]["content"])
-        assert payload["user_prefix"] == "Stop worrying."  # Never the LCP "stop".
-        assert payload["assistant_already_heard"] == "Keep explaining the route."
-        assert payload["pending_work"] and payload["assistant_name"] == "Frankie"
-        assert payload["user_speaking"] and not payload["prefix_final"]
-        assert not payload["prefix_stable"]
-        assert decision.observed_ms == 500 and decision.revision == snap.revision
+        # The full changed text remains available, but cannot pass stability;
+        # do not spend a brain probe or crop it to the apparently stable "stop".
+        assert not service.prompts and service.listener_bank is None
+        assert stats["semantic_skipped"] and stats["semantic_skip_reason"] == "unstable"
+        assert evidence.snapshot.observed_ms == 500 and evidence.snapshot.revision == snap.revision
         assert [len(call[0]) for call in ear.calls] == [240 * 24, 400 * 24]
         assert len({call[2] for call in ear.calls}) == 1
         assert ear.calls[0][2] != threading.get_ident()
         assert session.items == before and not service.jobs and listener.job is None
-        assert stats["ear_ms"] == 12 and stats["completion_tokens"] == 2
+        assert stats["ear_ms"] >= 0 and "completion_tokens" not in stats
     asyncio.run(fixture(check, ["Stop", "Stop worrying."]))
 
 
@@ -119,10 +130,11 @@ def test_short_final_prefix_has_no_fabricated_earlier_audio(rate):
             assistant_name=None)
         assert len(ear.calls) == 1 and ear.calls[0][1] == rate
         assert evidence.previous_text is None and evidence.previous_samples is None
-        payload = json.loads(service.prompts[0]["messages"][-1]["content"])
+        payload = floor_payload(service.prompts[0])
         assert payload["prefix_final"] and not payload["user_speaking"]
         assert not payload["prefix_stable"]
-        assert decision.observed_ms == 220
+        assert evidence.snapshot.observed_ms == 220
+        assert decision == ListeningDecision("wait")
     asyncio.run(fixture(check, ["Yes."]))
 
 
@@ -131,8 +143,51 @@ def test_agreeing_complete_snapshots_are_marked_lexically_stable_only():
         _, evidence, _ = await listener.classify_prefix(snapshot(), heard_text="", pending_work=False,
                                                        assistant_name="Frankie")
         assert evidence.stable(160)
-        assert json.loads(service.prompts[0]["messages"][-1]["content"])["prefix_stable"]
+        assert floor_payload(service.prompts[0])["prefix_stable"]
     asyncio.run(fixture(check, ["No.", "No."]))
+
+
+def test_floor_yield_declares_semantic_assertions_without_inventing_confidence():
+    async def check(listener, service, session, ear, owner):
+        service.action = "yield"
+        decision, evidence, _ = await listener.classify_prefix(
+            snapshot(), heard_text="", pending_work=False, assistant_name="Frankie")
+        assert decision == ListeningDecision("yield", addressed_to_assistant=True,
+                                             sufficient_evidence=True)
+        assert decision.intent == "take_floor" and not hasattr(decision, "confidence")
+        assert evidence.stable(160)
+        assert floor_payload(service.prompts[0])["user_prefix"] == "Please let me finish."
+    asyncio.run(fixture(check, ["Please let me finish.", "Please let me finish."]))
+
+
+@pytest.mark.parametrize("action", ["continue", "wait"])
+def test_non_yield_floor_labels_make_no_positive_semantic_assertions(action):
+    assert parse_floor_decision("  " + action + "\n") == ListeningDecision(action)
+
+
+@pytest.mark.parametrize("raw", ["stop", "adapt", "YIELD", "yield.", "yield wait",
+                                 '{"action":"yield","confidence":1.0}', "<think>x</think>yield"])
+def test_floor_parser_rejects_legacy_stop_and_other_non_contract_outputs(raw):
+    with pytest.raises(ValueError, match="invalid action"):
+        parse_floor_decision(raw)
+
+
+@pytest.mark.parametrize("phase", ["prefix", "final"])
+def test_obsolete_stop_label_is_rejected_by_both_streaming_adapter_paths(phase):
+    async def check(listener, service, session, ear, owner):
+        service.action = "stop"
+        session.settings["streaming_listener"] = "semantic"
+        with pytest.raises(ValueError, match="invalid action"):
+            if phase == "prefix":
+                await listener.classify_prefix(snapshot(), heard_text="", pending_work=False,
+                                               assistant_name="Frankie")
+            else:
+                item = {"id": "final", "content": [{"type": "input_audio",
+                        "_pcm": np.zeros(9600, dtype=np.float32), "_rate": 24000}]}
+                await listener.classify(item, NS(chunks=[], played_ms=0))
+        assert not service.jobs and listener.job is None
+        assert floor_payload(service.prompts[0])["prefix_final"] == (phase == "final")
+    asyncio.run(fixture(check, ["Please stop speaking."] * 2))
 
 
 @pytest.mark.parametrize("mtp", [0, 2])

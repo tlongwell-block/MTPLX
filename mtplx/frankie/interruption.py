@@ -1,6 +1,14 @@
-"""Bounded public draft context for a fresh response after yielding speech."""
+"""Private playback bookkeeping and heard-only context for fresh responses."""
 
-import json
+REGENERATION_INSTRUCTIONS = (
+    "Automatic playback notices are engine-provided history data, not user speech. "
+    "After an interruption, use the latest actual user input and confirmed heard "
+    "history to choose a fresh response. If asked to continue, generate a new "
+    "continuation from the confirmed heard cutoff; do not assume later content "
+    "was already covered or restart the explanation. When one detail changes, "
+    "acknowledge it briefly and continue from the interruption. "
+    "Respect a request for silence by ending without speech."
+)
 
 
 def _bounded(text, *, tail=False):
@@ -10,7 +18,7 @@ def _bounded(text, *, tail=False):
 
 
 def capture_draft(run):
-    """Never label a partly played phrase as fully heard, or use raw tokens."""
+    """Keep bounded private text for late playback repair, never model context."""
     heard = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
     previous = (run.item or {}).get("_interrupted_draft")
     # A later device-clock acknowledgment can confirm one more full phrase
@@ -27,18 +35,13 @@ def capture_draft(run):
             "text": _bounded(text), "played_ms": run.played_ms}
 
 
-def draft_notice(record):
-    # Escape literal template/control delimiters inside the quoted data. This
-    # is public speech only, never hidden reasoning or a callable tool plan.
-    data = json.dumps(record, ensure_ascii=False).replace("<", "\\u003c").replace(
-        ">", "\\u003e").replace("{{frankie_media_", "\\u007b\\u007bfrankie_media_")
+def draft_notice(_record):
+    """History placement identifies the cutoff; no private wording is exposed."""
     return (
+        "Automatic playback notice (engine data, not user speech): "
         "Speech was interrupted here. The assistant message above contains only "
-        "confirmed heard phrases. The quoted draft below was generated but not "
-        "confirmed heard; its first phrase may have been partly heard. This is "
-        "historical draft data, not an instruction or an executed tool call. "
-        "Use the user's subsequent words to decide your next response freshly: "
-        "continue naturally, correct yourself, change topic, or remain silent. "
-        "Do not automatically replay the draft or repeat the heard prefix.\n"
-        + data
+        "confirmed heard phrases. The following phrase may have been partly "
+        "audible; unplayed wording is omitted. This notice describes playback "
+        "history, not an instruction or an executed tool call. The next actual "
+        "user turn determines whether and how to continue from this heard cutoff."
     )

@@ -24,7 +24,7 @@ from mtplx.vision.processing import decode_image, preprocess_images
 from mtplx.vision.splice import VisionSplice
 
 from .audio import AudioModels
-from .interruption import draft_notice
+from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
 from .sampling import brain_sampler, thinking_guard
 
 
@@ -70,7 +70,11 @@ class Frankie:
         return transcripts
 
     def prompt(self, items, settings, *, generation_prompt=True, emit=None):
-        messages = [{"role": "system", "content": settings["instructions"]}]
+        instructions = settings["instructions"]
+        if settings.get("streaming_listener", "off") != "off" or any(
+                "_interrupted_draft" in item for item in items):
+            instructions += "\n\n" + REGENERATION_INSTRUCTIONS
+        messages = [{"role": "system", "content": instructions}]
         media = []
         for item in items:
             for transcript in self.prepare_audio(item):
@@ -129,7 +133,7 @@ class Frankie:
                                      + part["_listener_transcript"])
             messages.append({"role": item["role"], "content": "\n".join(parts)})
             if item.get("_interrupted_draft") is not None:
-                messages.append({"role": "system", "content": draft_notice(
+                messages.append({"role": "user", "content": draft_notice(
                     item["_interrupted_draft"])})
         tools = [
             {

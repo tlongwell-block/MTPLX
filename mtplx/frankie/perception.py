@@ -10,13 +10,14 @@ from dataclasses import replace
 
 import numpy as np
 
+from .floor import floor_messages, parse_floor_decision
 from .interaction import (
     MAX_OBSERVATION_SECONDS,
     ListenerObservation,
     parse_compact_decision,
     semantic_messages,
 )
-from .listening import PrefixEvidence
+from .listening import ListeningDecision, PrefixEvidence
 
 
 class RealtimeListener:
@@ -51,6 +52,7 @@ class RealtimeListener:
     @staticmethod
     def _data():
         return {"messages": [], "max_tokens": 6, "temperature": 0, "seed": 0,
+                "presence_penalty": 0, "frequency_penalty": 0,
                 "thinking": "off", "enable_thinking": False, "tools": []}
 
     async def _run(self, data, prepare, *, prepare_only=False):
@@ -123,11 +125,13 @@ class RealtimeListener:
             observed = replace(observation, user_text=" ".join(
                 part["_transcript"].strip() for part in parts if part["_transcript"].strip()))
             prepared["observation"] = observed
-            job.data["messages"] = semantic_messages(observed, compact=True)
+            job.data["messages"] = (floor_messages(observed) if streaming else
+                                    semantic_messages(observed, compact=True))
 
         event, stats = await self._run(data, prepare)
         observed = prepared["observation"]
-        decision = parse_compact_decision(event["message"]["content"], observed)
+        decision = (parse_floor_decision(event["message"]["content"]) if streaming else
+                    parse_compact_decision(event["message"]["content"], observed))
         return decision, observed, stats
 
     def _hear_prefix(self, snapshot, job, *, compare):
@@ -151,12 +155,24 @@ class RealtimeListener:
         # or mutated, and no partial rows/transcript can poison final input.
         return PrefixEvidence(snapshot, text, previous_text, previous_samples)
 
-    async def classify_prefix(self, snapshot, *, heard_text, pending_work, assistant_name):
+    async def classify_prefix(self, snapshot, *, heard_text, pending_work, assistant_name,
+                              require_stable=True):
+        if type(require_stable) is not bool:
+            raise ValueError("Prefix stability policy must be boolean.")
+        started = time.monotonic()
         await self._admit()
+        generation = self._generation
         prepared = {}
 
         def prepare(job):
-            evidence = self._hear_prefix(snapshot, job, compare=True)
+            evidence = self._hear_prefix(snapshot, job, compare=require_stable)
+            # Ear screening and an eligible brain probe share one admission.
+            # Check supersession before warming/tokenizing on that same owner.
+            if job.cancelled.is_set() or self.session.closed or generation != self._generation:
+                raise RuntimeError("Listener observation was cancelled after acoustic preflight.")
+            prepared["evidence"] = evidence
+            if not evidence.has_words or (require_stable and not snapshot.final and not evidence.stable(160)):
+                return evidence
             observation = ListenerObservation(
                 utterance_id=snapshot.utterance_id, revision=snapshot.revision,
                 observed_ms=round(snapshot.observed_ms), user_text=evidence.text,
@@ -166,12 +182,19 @@ class RealtimeListener:
                 speech_ms=round(snapshot.samples * 1000 / snapshot.sample_rate),
                 pending_work=pending_work, assistant_name=assistant_name,
             )
-            prepared.update(evidence=evidence, observation=observation)
-            job.data["messages"] = semantic_messages(observation, compact=True)
+            job.data["messages"] = floor_messages(observation)
 
         event, stats = await self._run(self._data(), prepare)
-        decision = parse_compact_decision(event["message"]["content"], prepared["observation"])
-        return decision, prepared["evidence"], stats
+        evidence = prepared["evidence"]
+        if self.session.closed or generation != self._generation:
+            raise RuntimeError("Listener observation was cancelled after acoustic preflight.")
+        skipped = "prepared" in event
+        stats.update(semantic_skipped=skipped, elapsed_ms=(time.monotonic() - started) * 1000)
+        if skipped:
+            stats["semantic_skip_reason"] = "empty" if not evidence.has_words else "unstable"
+            return ListeningDecision("wait"), evidence, stats
+        decision = parse_floor_decision(event["message"]["content"])
+        return decision, evidence, stats
 
     async def recheck_prefix(self, snapshot):
         await self._admit()

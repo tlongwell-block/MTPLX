@@ -150,8 +150,17 @@ def test_unqualified_observation_only_or_disabled_interruption_never_controls(mo
 
 
 def test_changed_transcript_recheck_cannot_apply_an_obsolete_prefix_decision():
+    class RevisedListener(Listener):
+        async def classify_prefix(self, ticket, **kwargs):
+            revalidation = bool(self.snapshots)
+            result = await super().classify_prefix(ticket, **kwargs)
+            if revalidation:
+                return (ListeningDecision("wait"),
+                        PrefixEvidence(ticket, self.recheck_text), {"fixture": True})
+            return result
+
     async def check(s, e):
-        listener = Listener(held=True, recheck_text="Actually, don't change the date.")
+        listener = RevisedListener(held=True, recheck_text="Actually, don't change the date.")
         await enable(s, listener)
         old = staged_reply(s)
         await feed(s, 16000, 10)
@@ -160,6 +169,7 @@ def test_changed_transcript_recheck_cannot_apply_an_obsolete_prefix_decision():
         listener.release.set()
         await wait_for(lambda: s.prefix_task is None)
         assert len(listener.rechecks) == 1
+        assert len(listener.snapshots) == 2
         assert not old.abort.is_set() and clear_events(s) == []
         assert not e.calls
     asyncio.run(setup(check))

@@ -598,7 +598,8 @@ class Session:
 
     def cancel_prefix(self):
         self.prefix_listener.cancel()
-        if self.prefix_task is not None and self.prefix_task is not asyncio.current_task():
+        if (self.prefix_task is not None and self.prefix_task is not asyncio.current_task()
+                and not self.prefix_task.done() and not self.prefix_task.cancelling()):
             self.prefix_task.cancel()
 
     def append_prefix(self, frame):
@@ -609,6 +610,8 @@ class Session:
         if not observer.active:
             return
         observer.append(np.clip(frame * 32767, -32768, 32767).astype("<i2").tobytes())
+        if self.clock_ms - self.speech_start_ms + 32 < 320:
+            return  # Retained context/pre-roll is not newly observed speech.
         ticket = observer.request()
         if ticket is not None:
             run = self.overlap_run
@@ -627,23 +630,48 @@ class Session:
     async def observe_prefix(self, ticket, run, heard, pending, name):
         """A disposable prefix can yield the floor, never finish the user's turn."""
         observer = self.prefix_listener
+        started = time.monotonic()
         try:
             decision, evidence, stats = await self.listener.classify_prefix(
                 ticket, heard_text=heard, pending_work=pending, assistant_name=name)
             # Legacy compact observations make no addressee/sufficiency claim.
             qualified = decision if isinstance(decision, ListeningDecision) else ListeningDecision(decision.action)
             recheck = None
-            if qualified.intent == "take_floor" and qualified.sufficient_evidence:
+            revalidated = None
+            if (qualified.intent == "take_floor" and qualified.sufficient_evidence
+                    and qualified.addressed_to_assistant is True
+                    and (ticket.final or evidence.stable(observer.stability_ms))):
                 latest = observer.refresh(ticket)
                 if latest is not None and latest.samples != ticket.samples:
                     recheck = await self.listener.recheck_prefix(latest)
-            result = observer.complete(ticket, evidence, qualified, recheck=recheck)
+                    if recheck.text != evidence.text:
+                        # Classify all current words once, including any new
+                        # qualifier or revision. Do not crop to the old prefix.
+                        latest = observer.refresh(ticket)
+                        if latest is not None and observer.reserve_revalidation(ticket):
+                            next_decision, recheck, next_stats = await self.listener.classify_prefix(
+                                latest, heard_text=heard, pending_work=pending, assistant_name=name,
+                                require_stable=False)
+                            revalidated = (next_decision if isinstance(next_decision, ListeningDecision)
+                                           else ListeningDecision(next_decision.action))
+                            stats = {**stats, "revalidation": next_stats}
+            result = observer.complete(ticket, evidence, qualified, recheck=recheck,
+                                       revalidated=revalidated,
+                                       semantic_skipped=stats.get("semantic_skipped", False))
+            cutoff = recheck.snapshot if recheck is not None else ticket
             apply = (result.apply and self.current is run and not run.abort.is_set()
                      and not run.playback_finished and self.listening
                      and self.settings["turn_detection"].get("interrupt_response", True))
             self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
                        response_id=run.id, action=result.action, gate=result.reason,
-                       metrics=stats, apply=apply, confidence=None)
+                       transcript=evidence.text, previous_transcript=evidence.previous_text,
+                       recheck_transcript=recheck.text if recheck is not None else None,
+                       observed_audio_ms=round(ticket.samples * 1000 / ticket.sample_rate),
+                       decision_audio_ms=round(cutoff.observed_ms),
+                       apply_lag_ms=round((time.monotonic() - cutoff.captured_at) * 1000, 3),
+                       causal_cutoff=revalidated is not None,
+                       metrics={**stats, "total_ms": (time.monotonic() - started) * 1000},
+                       apply=apply, confidence=None)
             if apply:
                 self.rollback_unheard(run)
                 # Keep the complete captured PCM. Ordinary endpointing and a
@@ -836,9 +864,13 @@ class Session:
         self.metrics["barge_ins"] += 1
         text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
         if run.item is not None:
-            for item in self.items:
-                item.pop("_interrupted_draft", None)
-            run.item["_interrupted_draft"] = draft
+            index = next((i for i, item in enumerate(self.items) if item is run.item), -1)
+            newest = max((i for i, item in enumerate(self.items)
+                          if "_interrupted_draft" in item), default=-1)
+            if index >= newest:
+                for item in self.items:
+                    item.pop("_interrupted_draft", None)
+                run.item["_interrupted_draft"] = draft
             run.item["content"] = [{"type": "output_audio", "transcript": text}]
             run.text = text
 

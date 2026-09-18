@@ -155,6 +155,10 @@ def serve(args):
                         "error",
                         error={"type": "invalid_request_error", "message": str(exc)},
                     )
+                except RuntimeError as exc:
+                    session.event(
+                        "error", error={"type": "server_error", "message": str(exc)},
+                    )
         except WebSocketDisconnect:
             pass
         finally:

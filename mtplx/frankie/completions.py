@@ -19,6 +19,14 @@ from collections import deque
 from .sampling import brain_sampler, thinking_guard, thinking_mode
 
 
+def _listener_prefill_tokens():
+    """Private experiment knob; keep each internal owner slice bounded."""
+    try:
+        return max(32, min(128, int(os.environ.get("FRANKIE_LISTENER_PREFILL_TOKENS", "64"))))
+    except ValueError:
+        return 64
+
+
 class Job:
     def __init__(self, data, chat, loop):
         self.data, self.chat, self.loop = data, chat, loop
@@ -44,7 +52,11 @@ class Job:
         self.internal = False
         self.prepare_callback = None
         self.prepare_only = False
+        self.prepare_seconds = 0.0
         self.bank = None
+        self.owner_work_ms = 0.0
+        self.owner_slices = 0
+        self.owner_max_slice_ms = 0.0
 
     def emit(self, value):
         try:
@@ -75,6 +87,9 @@ class Completions:
         self.batch = None
         self.driver = None
         self.listener_bank = None
+        self.listener_prefixes = set()
+        self.detokenizer_template = None
+        self.listener_detokenizer_primed = False
 
     def submit(self, data, chat, *, internal=False, prepare=None, prepare_only=False):
         if prepare_only and (not internal or not callable(prepare)):
@@ -101,21 +116,65 @@ class Completions:
         """One bounded internal owner operation, with no brain warmup/prefill."""
         return self.submit({}, True, internal=True, prepare=callback, prepare_only=True)
 
+    @staticmethod
+    def owner_work(job, callback, *args):
+        """Measure owner execution only; exclude waits for speech/scheduling."""
+        if not getattr(job, "internal", False):
+            return callback(*args)
+        started = time.perf_counter()
+        try:
+            return callback(*args)
+        finally:
+            elapsed = (time.perf_counter() - started) * 1000
+            job.owner_work_ms = getattr(job, "owner_work_ms", 0.0) + elapsed
+            job.owner_slices = getattr(job, "owner_slices", 0) + 1
+            job.owner_max_slice_ms = max(getattr(job, "owner_max_slice_ms", 0.0), elapsed)
+
+    @staticmethod
+    def owner_usage(job):
+        if not getattr(job, "internal", False):
+            return {}
+        return {"listener_owner_work_ms": round(getattr(job, "owner_work_ms", 0.0), 3),
+                "listener_owner_slices": getattr(job, "owner_slices", 0),
+                "listener_owner_max_slice_ms": round(getattr(job, "owner_max_slice_ms", 0.0), 3)}
+
+    def new_detokenizer(self):
+        # TokenizerWrapper.detokenizer constructs a fresh vocabulary map on
+        # every access. Stock BPE.reset replaces all mutable request state;
+        # its tokenmap/byte decoder are read-only and safe to share. Other
+        # detokenizer implementations retain their existing construction path.
+        from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+        template = getattr(self, "detokenizer_template", None)
+        if template is None:
+            template = self.engine.tokenizer.detokenizer
+            if type(template) is BPEStreamingDetokenizer:
+                self.detokenizer_template = template
+        result = copy.copy(template)
+        result.reset()
+        return result
+
     def run_preparation(self, job):
         try:
             if not job.cancelled.is_set():
                 started = time.monotonic()
-                value = job.prepare_callback(job)
-                if not job.cancelled.is_set():
-                    job.done = True
-                    job.emit({"prepared": value,
-                              "listener_prepare_seconds": time.monotonic() - started})
+                value = self.owner_work(job, job.prepare_callback, job)
+                job.prepare_seconds = time.monotonic() - started
+                self.finish_preparation(job, value)
         except Exception as exc:  # noqa: BLE001 — owner callback errors cross this job boundary.
             if not job.cancelled.is_set():
                 job.emit({"error": str(exc)})
         finally:
             job.prepare_callback = None
             self.jobs.discard(job)
+
+    def finish_preparation(self, job, value):
+        # Called after owner_work returns, so usage includes the completed
+        # preparation slice. No tokenization or cache is needed for this result.
+        if not job.cancelled.is_set():
+            job.done = True
+            job.emit({"prepared": value, "listener_prepare_seconds": job.prepare_seconds,
+                      "usage": self.owner_usage(job)})
+        self.jobs.discard(job)
 
     async def drive(self):
         while self.jobs:
@@ -133,7 +192,25 @@ class Completions:
         # playback reserve, and let the existing audio producer refill it.
         if lead < 0.6:
             return False
+        def internal_next():
+            # Non-MTP batching can advance HTTP work alongside the listener;
+            # retain its existing single-step behavior.
+            if not self.engine.mtp:
+                return False
+            if self.pending:
+                return getattr(self.pending[0], "internal", False)
+            return any(getattr(job, "internal", False) and not job.cancelled.is_set()
+                       for job in self.active.values())
+        burst = internal_next()
+        started = time.monotonic() if burst else 0
         self.step(voice=True)
+        if burst:
+            for _ in range(2):
+                if lead - (time.monotonic() - started) < 0.6 or not internal_next():
+                    break
+                # Admission may change from the event-loop thread between the
+                # check and this call. Never advance HTTP in an extra slice.
+                self.step(voice=True, internal_only=True)
         return True
 
     def warm_listener(self):
@@ -152,35 +229,70 @@ class Completions:
                 # Expiry must not trigger a cold warmup during live overlap.
                 idle_ttl_s=float("inf"),
             )
-        if self.engine.mtp and not len(self.listener_bank):
-            from .interaction import ListenerObservation, semantic_messages
-            instructions = semantic_messages(
-                ListenerObservation("warmup", 0, 0, ""), compact=True,
-            )[0]["content"]
-            self.engine.warm(
-                {"instructions": instructions, "thinking": "off", "tools": []},
-                session_id="listener-prefix", bank=self.listener_bank,
-            )
-            if not len(self.listener_bank):
-                raise RuntimeError("Listener instruction cache exceeded its memory budget.")
+        if self.engine.mtp:
+            from .floor import floor_messages
+            from .interaction import ListenerObservation
+            observation = ListenerObservation("warmup", 0, 0, "")
+            # One hybrid state already includes substantial recurrent memory.
+            # Cache the v5 policy only; legacy observations may prefill cold.
+            policies = [floor_messages(observation)[0]["content"]]
+            for index, instructions in enumerate(policies):
+                if instructions in self.listener_prefixes:
+                    continue
+                # This immutable prefix is restored in full; intermediate GDN
+                # boundaries only multiply its recurrent storage. The single
+                # inference owner cannot run another model job during warmup.
+                # Restore ordinary conversation capture even if warmup fails.
+                capture = os.environ.get("MTPLX_GDN_BOUNDARY_CAPTURE")
+                try:
+                    os.environ["MTPLX_GDN_BOUNDARY_CAPTURE"] = "0"
+                    self.engine.warm(
+                        {"instructions": instructions, "thinking": "off", "tools": []},
+                        session_id=f"listener-prefix-{index}", bank=self.listener_bank,
+                    )
+                finally:
+                    if capture is None:
+                        os.environ.pop("MTPLX_GDN_BOUNDARY_CAPTURE", None)
+                    else:
+                        os.environ["MTPLX_GDN_BOUNDARY_CAPTURE"] = capture
+                if len(self.listener_bank) < len(self.listener_prefixes) + 1:
+                    self.listener_bank.clear()
+                    self.listener_prefixes.clear()
+                    raise RuntimeError("Listener instruction cache exceeded its memory budget.")
+                self.listener_prefixes.add(instructions)
+        # Session startup already calls warm_listener on this owner. Prime the
+        # immutable BPE vocabulary map there instead of the first live probe.
+        if (not getattr(self, "listener_detokenizer_primed", False)
+                and getattr(self.engine, "tokenizer", None) is not None):
+            self.new_detokenizer()
+            self.listener_detokenizer_primed = True
         return {"cache_bytes": self.listener_bank.total_nbytes}
 
     def prepare(self, job):
-        from mtplx.server.omlx_bridge.thinking import ThinkingParser
-        from mtplx.server.omlx_bridge.tool_calling import ToolCallStreamFilter
-
+        if job.prepare_callback is not None:
+            # Includes acoustic inference, if needed, on the same owner as
+            # brain/mouth inference and with voice feature capture suspended.
+            started = time.monotonic()
+            try:
+                value = job.prepare_callback(job)
+            finally:
+                job.prepare_callback = None
+                job.prepare_seconds = time.monotonic() - started
+            if job.cancelled.is_set():
+                return
+            # Internal acoustic screening may finish without a brain request.
+            # None retains the normal path; even falsey results are terminal.
+            if job.internal and value is not None:
+                return value
+            job.emit({"listener_prepare_seconds": job.prepare_seconds})
         if job.internal:
             self.warm_listener()
             job.bank = self.listener_bank
         else:
             job.bank = self.engine.bank
-        if job.prepare_callback is not None:
-            # Includes acoustic inference, if needed, on the same owner as
-            # brain/mouth inference and with voice feature capture suspended.
-            started = time.monotonic()
-            job.prepare_callback(job)
-            job.emit({"listener_prepare_seconds": time.monotonic() - started})
-            job.prepare_callback = None
+        from mtplx.server.omlx_bridge.thinking import ThinkingParser
+        from mtplx.server.omlx_bridge.tool_calling import ToolCallStreamFilter
+
         data = job.data
         if job.chat:
             items, instructions = [], []
@@ -217,8 +329,7 @@ class Completions:
         if job.splice is not None and not self.engine.mtp:
             from mlx_lm.models.cache import make_prompt_cache
             job.cache = make_prompt_cache(self.engine.runtime.model)
-        job.detokenizer = copy.copy(self.engine.tokenizer.detokenizer)
-        job.detokenizer.reset()
+        job.detokenizer = self.new_detokenizer()
         job.thinking = ThinkingParser(starts_in_thinking=bool(data.get("enable_thinking")))
         job.tools = ToolCallStreamFilter(self.engine.tokenizer)
         if self.engine.mtp:
@@ -297,7 +408,7 @@ class Completions:
                 restore_mode="clone", session_id=job.id,
                 store_prefix_snapshot=False,
                 abort_check=job.cancelled.is_set, vision_splice=job.splice,
-                prefill_chunk_size=64,
+                prefill_chunk_size=128 if getattr(job, "internal", False) else 64,
                 prefill_step_size=lambda: job.prefill_step_size,
             )
             job.cached_tokens = state.cached_tokens
@@ -340,18 +451,23 @@ class Completions:
         self.active.pop(job.uid, None)
         self.jobs.discard(job)
 
-    def step_mtp(self, voice):
+    def step_mtp(self, voice, *, internal_only=False):
         for job in list(self.active.values()):
             if job.cancelled.is_set():
                 self.close_mtp_job(job)
-        if self.pending:
+        if self.pending and (not internal_only or getattr(self.pending[0], "internal", False)):
             job = self.pending.popleft()
             if job.cancelled.is_set():
                 self.jobs.discard(job)
             else:
                 try:
-                    self.prepare(job)
-                    self.insert(job)
+                    value = self.owner_work(job, self.prepare, job)
+                    if job.cancelled.is_set():
+                        self.jobs.discard(job)
+                    elif job.internal and value is not None:
+                        self.finish_preparation(job, value)
+                    else:
+                        self.insert(job)
                 except Exception as exc:
                     self.jobs.discard(job)
                     job.emit({"error": str(exc)})
@@ -360,21 +476,24 @@ class Completions:
             # Only one bounded internal probe is admitted. Prefer its short
             # decoding slices, yielding back to speech between every slice.
             uid = next((uid for uid, j in self.active.items() if getattr(j, "internal", False)),
-                       next(iter(self.active)))
+                       None if internal_only else next(iter(self.active)))
+            if uid is None:
+                return
             job = self.active.pop(uid)
             self.active[uid] = job
             try:
                 # Batch idle prefill efficiently, but return to a small slice
                 # as soon as voice needs the shared inference owner. Yield
                 # after each slice so a new voice turn can start promptly.
-                job.prefill_step_size = 32 if voice else 64
+                job.prefill_step_size = (_listener_prefill_tokens() if getattr(job, "internal", False)
+                                         else (32 if voice else 64))
                 # This legacy layout hint is process-global. Restore the voice
                 # owner's value when yielding between independent HTTP jobs.
                 context_key = "MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"
                 previous_context = os.environ.get(context_key)
                 os.environ[context_key] = str(len(job.ids))
                 try:
-                    job.context.run(next, job.steps)
+                    self.owner_work(job, job.context.run, next, job.steps)
                 finally:
                     if previous_context is None:
                         os.environ.pop(context_key, None)
@@ -431,10 +550,11 @@ class Completions:
         job.emit({"finish_reason": reason, "message": result,
             "usage": {"prompt_tokens": len(job.ids), "completion_tokens": len(job.tokens),
                       "prompt_tokens_details": {"cached_tokens": job.cached_tokens},
-                      "total_tokens": len(job.ids) + len(job.tokens)}})
+                      "total_tokens": len(job.ids) + len(job.tokens),
+                      **self.owner_usage(job)}})
         self.jobs.discard(job)
 
-    def step(self, *, voice=False):
+    def step(self, *, voice=False, internal_only=False):
         import mlx.core as mx
         model = getattr(self.engine.runtime.model, "language_model", self.engine.runtime.model)
         features = getattr(model, "_mtplx_feature_stream", None)
@@ -449,9 +569,11 @@ class Completions:
                     self.engine.background_step = None
                 return
             if self.engine.mtp:
-                self.step_mtp(voice)
+                self.step_mtp(voice, internal_only=internal_only)
                 if not self.jobs:
                     self.engine.background_step = None
+                return
+            if internal_only:
                 return
             for uid, job in list(self.active.items()):
                 if job.cancelled.is_set():
@@ -466,7 +588,13 @@ class Completions:
                 else:
                     try:
                         if job.ids is None:
-                            self.prepare(job)
+                            value = self.owner_work(job, self.prepare, job)
+                            if job.cancelled.is_set():
+                                self.pending.popleft()
+                                self.jobs.discard(job)
+                            elif job.internal and value is not None:
+                                self.pending.popleft()
+                                self.finish_preparation(job, value)
                         elif job.splice is not None and job.offset < len(job.ids) - 1:
                             from mtplx.vision.splice import spliced_chunk_embeddings
                             end = min(job.offset + (32 if voice else 128), len(job.ids) - 1)

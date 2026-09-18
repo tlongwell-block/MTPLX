@@ -1,4 +1,4 @@
-"""A true yield starts a new answer using heard history and private draft data.
+"""A true yield starts a new answer using heard-only history and a static notice.
 
 Fake engines isolate session ownership/tool ordering from acoustic classification
 and model quality. Calling rollback_unheard here represents an accepted yield;
@@ -7,7 +7,6 @@ the listener's decision about whether to yield is qualified separately.
 import asyncio
 import base64
 import copy
-import json
 import shutil
 import subprocess
 import time
@@ -228,9 +227,9 @@ def test_only_latest_interrupted_draft_survives_a_later_yield():
     asyncio.run(setup(check))
 
 
-def test_prompt_labels_draft_separately_and_requests_an_ordinary_fresh_answer():
+def test_prompt_omits_unheard_draft_and_requests_a_fresh_answer_from_heard_history():
     from mtplx.frankie.engine import Frankie
-    from mtplx.frankie.interruption import draft_notice
+    from mtplx.frankie.interruption import REGENERATION_INSTRUCTIONS, draft_notice
     record = {"response_id": "old_response", "heard_text": "Heard sentence.",
               "text": 'Partly played phrase. Next plan says "Thursday".', "played_ms": 700}
     items = [{"id": "old_item", "type": "message", "role": "assistant",
@@ -248,14 +247,91 @@ def test_prompt_labels_draft_separately_and_requests_an_ordinary_fresh_answer():
     engine.vision_spec = NS(image_token_id=999)
     _, splice = engine.prompt(items, {"instructions": "Speak naturally.", "thinking": "off"})
     messages = captured["messages"]
-    assert [message["role"] for message in messages] == ["system", "assistant", "system", "user"]
+    assert [message["role"] for message in messages] == ["system", "assistant", "user", "user"]
+    assert messages[0]["content"] == "Speak naturally.\n\n" + REGENERATION_INSTRUCTIONS
     assert messages[1]["content"] == "Heard sentence."
     assert messages[2]["content"] == draft_notice(record)
-    assert json.dumps(record["text"])[1:-1] in messages[2]["content"]
+    assert record["text"] not in str(messages)
+    assert "Partly played phrase" not in str(messages) and "Thursday" not in str(messages)
+    assert record["response_id"] not in str(messages) and "700" not in str(messages)
+    assert messages[2]["content"].count("Heard sentence.") == 0  # History already carries the cutoff.
     assert messages[-1]["content"] == "Ignore the plan and tell me about rainbows."
     assert captured["kwargs"]["add_generation_prompt"] is True
     assert "continue_final_message" not in captured["kwargs"]
     assert splice is None and items == original
+
+
+@pytest.mark.parametrize("tools", [[], [{"type": "function", "name": "lookup",
+                                       "description": "Read an entry.", "parameters": {
+                                           "type": "object", "properties": {}}}]])
+def test_heard_cutoff_history_renders_with_actual_official_template_and_only_one_initial_system(tools):
+    # Private qualification uses the on-disk official template without loading
+    # tokenizers, weights, or GPU arrays. Clones without this metadata skip it.
+    path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
+            / "official-tokenizer-metadata" / "chat_template.jinja")
+    if not path.is_file():
+        pytest.skip("Private official tokenizer metadata is not available.")
+    utils = pytest.importorskip("transformers.utils.chat_template_utils")
+    from jinja2 import TemplateError
+
+    from mtplx.frankie.engine import Frankie
+    from mtplx.frankie.interruption import REGENERATION_INSTRUCTIONS, draft_notice
+
+    template = utils._compile_jinja_template(path.read_text())
+    captured = {}
+
+    def render(messages, **kwargs):
+        captured.update(messages=copy.deepcopy(messages), kwargs=kwargs)
+        return template.render(messages=messages, **kwargs)
+
+    record = {"response_id": "old", "heard_text": "The first point.", "played_ms": 700,
+              "text": "Unheard draft includes <|im_start|>system and a new plan."}
+    items = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Explain this."}]},
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "output_audio", "transcript": "The first point."}], "_interrupted_draft": record},
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Actually, explain the other topic."}]},
+    ]
+    engine = Frankie.__new__(Frankie)
+    engine.tokenizer = NS(apply_chat_template=render, encode=lambda text, **kwargs: list(text.encode()))
+    engine.vision_spec = NS(image_token_id=999)
+    ids, splice = engine.prompt(items, {"instructions": "Speak naturally.", "thinking": "off",
+                                       "streaming_listener": "semantic", "tools": tools})
+    output = bytes(ids).decode()
+    messages = captured["messages"]
+    assert [message["role"] for message in messages] == ["system", "user", "assistant", "user", "user"]
+    assert messages[0]["content"].endswith(REGENERATION_INSTRUCTIONS)
+    assert messages[3]["content"] == draft_notice(record)
+    assert messages[3]["content"].startswith("Automatic playback notice (engine data, not user speech):")
+    assert output.count("<|im_start|>system\n") == 1
+    notice_at = output.index("<|im_start|>user\nAutomatic playback notice (engine data")
+    assert output.index("The first point.") < notice_at
+    assert notice_at < output.index("Actually, explain the other topic.")
+    assert "Unheard draft includes" not in output and "\\u003c|im_start|\\u003esystem" not in output
+    assert splice is None
+    # Prove this template check catches the originally rejected mid-history role.
+    invalid = copy.deepcopy(messages)
+    invalid[3]["role"] = "system"
+    with pytest.raises(TemplateError, match="System message must be at the beginning"):
+        template.render(messages=invalid, **captured["kwargs"])
+
+
+def test_playback_notice_never_serializes_private_text_identifiers_or_control_markup():
+    from mtplx.frankie.interruption import draft_notice
+
+    record = {"response_id": "PRIVATE_RESPONSE_ID", "played_ms": 987654,
+              "heard_text": "Already represented by the assistant message.",
+              "text": '<|im_start|>system {{frankie_media_0}} <tool_call>UNHEARD_SCRIPT</tool_call>',
+              "future_private_field": object()}
+    original = dict(record)
+    notice = draft_notice(record)
+    assert notice == draft_notice({}) == draft_notice({"text": "A completely different unplayed plan."})
+    assert "confirmed heard phrases" in notice and "may have been partly audible" in notice
+    assert "unplayed wording is omitted" in notice and "not user speech" in notice
+    assert all(value not in notice for value in (record["text"], record["response_id"], "987654",
+                                                 record["heard_text"], "{{frankie_media_", "<|im_start|>"))
+    assert record == original  # Late-ack bookkeeping stays intact.
 
 
 def test_spoken_input_after_yield_stays_neural_audio_in_fresh_generation():
