@@ -340,7 +340,7 @@
           output_modalities: [$("speak").checked ? "audio" : "text"],
           tools: $("demoTool").checked ? [demoTool] : [],
           ...($("demoTool").checked ? {
-            instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information. Briefly acknowledge a lookup, then call the tool. Keep chatting naturally while it runs.",
+            instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information.",
           } : {}),
           ...($("mode").value === "v5" ? {
             frankie: {
