@@ -81,6 +81,25 @@ function browser() {
   };
 }
 
+test("demo opts into reversible playback pause with heard-position feedback", () => {
+  const b = browser(); b.api.settings();
+  assert.equal(b.sent.at(-1).session.frankie.playback_pause, true);
+  assert.equal(b.sent.at(-1).session.frankie.playback_feedback, true);
+});
+
+test("pause and resume reach queued audio even after generation finishes", async () => {
+  const b = browser();
+  await b.api.onEvent({ type: "response.created", response: { id: "reply" } });
+  await b.api.onEvent({ type: "response.done", response: { id: "reply", status: "completed" } });
+  assert.equal(b.api.active, false);
+  await b.api.onEvent({ type: "frankie.playback.pause", response_id: "reply" });
+  await b.api.onEvent({ type: "frankie.playback.resume", response_id: "reply" });
+  assert.deepEqual(JSON.parse(JSON.stringify(b.audio)), [
+    { type: "pause", responseId: "reply" }, { type: "resume", responseId: "reply" },
+  ]);
+  assert.equal(b.sent.filter((e) => e.type === "conversation.item.truncate").length, 0);
+});
+
 test("completed playback retires after drain, before a new user turn", () => {
   const p = player(); p.add(); p.done();
   const output = p.render(3200);

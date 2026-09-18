@@ -56,6 +56,7 @@ class Response:
     merged: bool = False
     emitted_ms: float = 0.0
     playback_finished: bool = False
+    playback_paused: bool = False
     first_audio_at: float = 0.0
     task_results: set = field(default_factory=set)
 
@@ -100,6 +101,7 @@ class Session:
             "interruption_policy": "vad",
             "assistant_name": "Frankie",
             "playback_feedback": False,
+            "playback_pause": False,
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
@@ -164,6 +166,7 @@ class Session:
                 "input_context": True,
                 "background_tasks": self.settings["background_tasks"],
                 "playback_feedback": True,
+                "playback_pause": self.settings["playback_pause"],
                 "interruption_policy": self.settings["interruption_policy"],
                 "semantic_listener_available": self.listener is not None,
                 "assistant_name": self.settings["assistant_name"],
@@ -668,6 +671,7 @@ class Session:
 
     def reset_detectors(self):
         self.vad.reset()
+        self.voice_run = 0
         self.tail = np.empty(0, dtype=np.float32)
         self.system_tail = np.empty(0, dtype=np.float32)
         self.pre.clear()
@@ -722,7 +726,20 @@ class Session:
             self.queued_task_response, fragments,
         ))
 
+    def pause_playback(self, run, paused):
+        """Temporarily yield the speakers without discarding an unheard reply."""
+        if (run is None or run is not self.current or run.abort.is_set()
+                or run.playback_finished or run.playback_paused == paused):
+            return
+        if paused and not (self.settings["playback_pause"]
+                           and self.settings["playback_feedback"]):
+            return
+        run.playback_paused = paused
+        self.event("frankie.playback.pause" if paused else "frankie.playback.resume",
+                   response_id=run.id, item_id=run.item_id)
+
     def rollback_unheard(self, run):
+        run.playback_paused = False
         run.abort.set()
         run.ready.set()
         if self.playback_wake is not None:
@@ -778,6 +795,7 @@ class Session:
                 self.response_revision = revision
                 return
             if action in {"continue", "wait"}:
+                self.pause_playback(run, False)
                 # This utterance was acknowledged by the listener policy, not
                 # left waiting for a stale client response.create to answer it.
                 self.response_revision = revision
@@ -892,6 +910,13 @@ class Session:
                         self.discard_spec()
                     active = self.current
                     if self.voice_run >= 3 and active and active.visible:
+                        if (self.overlap_run is active
+                                and self.settings["interruption_policy"] == "semantic"
+                                and td.get("interrupt_response", True)):
+                            # VAD confirms speech in 96 ms. Stop the speakers now;
+                            # the slower semantic decision may resume this exact
+                            # queue for an acknowledgment or discard it on yield.
+                            self.pause_playback(active, True)
                         if (
                             not active.abort.is_set()
                             and (not active.done or self.audible_response() is active)
@@ -1020,6 +1045,10 @@ class Session:
                 if type(extensions["playback_feedback"]) is not bool:
                     raise ValueError("playback_feedback must be a boolean.")
                 new["playback_feedback"] = extensions["playback_feedback"]
+            if "playback_pause" in extensions:
+                if type(extensions["playback_pause"]) is not bool:
+                    raise ValueError("playback_pause must be a boolean.")
+                new["playback_pause"] = extensions["playback_pause"]
             if "assistant_name" in extensions:
                 name = extensions["assistant_name"]
                 if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
@@ -1107,6 +1136,11 @@ class Session:
                         ledger.complete(item["call_id"])
                 self.task_ledger = ledger
             self.settings = new
+            if (new["interruption_policy"] != "semantic"
+                    or not new["playback_pause"] or not new["playback_feedback"]
+                    or new["turn_detection"] is None
+                    or not new["turn_detection"].get("interrupt_response", True)):
+                self.pause_playback(self.current, False)
             self.reset_detectors()
             self.event("session.updated", session=self.info())
         elif kind == "conversation.item.create":
@@ -1275,6 +1309,10 @@ class Session:
             self.spawn(self.transcribe_item(item))
         elif kind == "input_audio_buffer.clear":
             self.discard_spec()
+            self.invalidate_semantics()
+            self.pause_playback(self.current, False)
+            self.overlap_run = None
+            self.overlap_prefix_ms = 0
             self.manual = []
             self.manual_size = 0
             self.frames = []

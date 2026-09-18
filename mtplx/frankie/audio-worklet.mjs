@@ -11,6 +11,7 @@ class DuplexAudio extends AudioWorkletProcessor {
     this.queued = 0;
     this.played = 0;
     this.item = null;
+    this.pausedResponseId = null;
     this.blocked = new Set();
     this.aside = [];
     this.asideQueued = 0;
@@ -22,6 +23,11 @@ class DuplexAudio extends AudioWorkletProcessor {
     this.ended = false;
     this.starved = false;
     this.port.onmessage = ({ data }) => {
+      if ((data.type === "pause" || data.type === "resume") &&
+          this.item?.responseId === data.responseId) {
+        this.pausedResponseId = data.type === "pause" ? data.responseId : null;
+        if (data.type === "pause") this.position("paused");
+      }
       if (data.type === "done" && this.item?.itemId === data.itemId) {
         this.ended = true;
         this.finishPlayback();
@@ -54,6 +60,7 @@ class DuplexAudio extends AudioWorkletProcessor {
         }
         if (!this.item || this.item.itemId !== data.itemId) {
           this.item = data;
+          this.pausedResponseId = null;
           this.played = 0;
           this.startedAt = null;
           this.ended = false;
@@ -68,6 +75,7 @@ class DuplexAudio extends AudioWorkletProcessor {
         this.queued += data.pcm.length;
       }
       if (data.type === "clear") {
+        this.pausedResponseId = null;
         if (this.item) this.blocked.add(this.item.itemId);
         if (this.blocked.size > 4096) {
           this.fail("playback item limit");
@@ -127,7 +135,9 @@ class DuplexAudio extends AudioWorkletProcessor {
       const waiting =
         this.startedAt === null && this.queued < 2880 && !this.ended;
       const head = waiting ? null : this.queue[0];
-      if (head) {
+      if (this.item?.responseId === this.pausedResponseId) {
+        output[i] = 0;
+      } else if (head) {
         this.starved = false;
         if (this.startedAt === null) this.startedAt = (frame + i) / sampleRate;
         output[i] = head.pcm[head.offset++] / 32768;

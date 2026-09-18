@@ -320,6 +320,7 @@
             frankie: {
               interruption_policy: "semantic",
               playback_feedback: true,
+              playback_pause: true,
               background_tasks: true,
             },
           } : {}),
@@ -507,6 +508,14 @@
         clearPlayback();
         return;
       }
+      if (e.type === "frankie.playback.pause" || e.type === "frankie.playback.resume") {
+        node?.port.postMessage({
+          type: e.type.endsWith("pause") ? "pause" : "resume",
+          responseId: e.response_id,
+        });
+        if (e.type.endsWith("pause")) interaction("listen");
+        return;
+      }
       if (e.type === "response.done") {
         if (e.response.id !== current) return;
         active = false;
@@ -576,9 +585,12 @@
             $("orb").style.setProperty("--input-scale", 1 + Math.min(0.25, peak / 32768));
             $("orb").style.setProperty("--voice-scale", 1 + Math.min(0.18, outputPeak / 32768));
             record("capture", { samples: data.pcm.length });
-          } else if (data.type === "position") {
+          } else if (data.type === "position" || data.type === "paused") {
             lastPlayback = data.playback;
             record("playback", { ...data.playback });
+            // Report the exact held position immediately for heard-prefix
+            // rollback; a pause is not an interruption or a truncation.
+            if (data.type === "paused") lastFeedback = -Infinity;
             feedback("position", data.playback);
           } else if (data.type === "finished") {
             lastPlayback = null;
