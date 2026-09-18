@@ -64,6 +64,7 @@ function browser() {
   vm.runInContext(page + `
     globalThis.api = {
       onEvent, settings, feedback, end,
+      evidence,
       attach(socket, processor) { ws = socket; node = processor; },
       get active() { return active; },
     };
@@ -85,6 +86,37 @@ test("demo keeps acknowledgments uninterrupted while reporting heard position", 
   const b = browser(); b.api.settings();
   assert.equal(b.sent.at(-1).session.frankie.playback_pause, false);
   assert.equal(b.sent.at(-1).session.frankie.playback_feedback, true);
+});
+
+test("completed transcripts replace placeholders and generated text beyond heard cutoff", async () => {
+  const b = browser();
+  await b.api.onEvent({ type: "conversation.item.created", item: {
+    id: "user", type: "message", role: "user", content: [{type: "input_audio"}],
+  }});
+  await b.api.onEvent({type: "conversation.item.input_audio_transcription.completed", item_id: "user", transcript: "Please continue."});
+  assert.equal(b.get("log").children[0].children[1].textContent, "Please continue.");
+  await b.api.onEvent({type: "response.output_audio_transcript.delta", item_id: "answer", delta: "Heard. Not yet heard."});
+  await b.api.onEvent({type: "response.output_audio_transcript.done", item_id: "answer", transcript: "Heard."});
+  assert.equal(b.get("log").children[1].children[1].textContent, "Heard.");
+});
+
+test("local diagnostics retain stop and listener evidence without raw media or arbitrary metrics", async () => {
+  const b = browser();
+  await b.api.onEvent({type: "frankie.metrics", response_id: "reply", metrics: {
+    generated_tokens: 2, finish_stop_origin: "initial_target", audio_seconds: 0.5,
+    cached_tokens: 2048, arbitrary_private_payload: "do not retain",
+  }});
+  await b.api.onEvent({type: "frankie.interaction.prefix", action: "wait", gate: "newer_audio",
+    transcript: "No, keep going", apply: false, audio: "do not retain"});
+  await b.api.onEvent({type: "response.done", response: {id: "reply", status: "completed"}});
+  const events = JSON.parse(JSON.stringify(b.api.evidence));
+  assert.equal(events[0].metrics.finish_stop_origin, "initial_target");
+  assert.equal(events[0].metrics.generated_tokens, 2);
+  assert.equal(events[1].transcript, "No, keep going");
+  assert.equal(events[1].apply, false);
+  assert.equal(events[2].status, "completed");
+  assert.equal(events[2].response_id, "reply");
+  assert.ok(!JSON.stringify(events).includes("do not retain"));
 });
 
 test("pause and resume reach queued audio even after generation finishes", async () => {

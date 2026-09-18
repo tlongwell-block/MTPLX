@@ -268,6 +268,31 @@
       evidence.push({ time: performance.now(), type, ...data });
       if (evidence.length > 20000) evidence.shift();
     }
+    function recordServerEvent(e) {
+      // Keep diagnostic text locally; never retain raw media or credentials.
+      const detail = { response_id: e.response_id || e.response?.id, item_id: e.item_id };
+      if (e.type === "conversation.item.input_audio_transcription.completed" ||
+          e.type === "response.output_audio_transcript.done" || e.type === "response.output_text.done")
+        detail.text = e.transcript ?? e.text;
+      if (e.type === "frankie.interaction.prefix" || e.type === "frankie.interaction.observed") {
+        for (const key of ["action", "gate", "apply", "transcript", "previous_transcript",
+          "recheck_transcript", "observed_audio_ms", "decision_audio_ms", "apply_lag_ms", "causal_cutoff", "decision"])
+          if (e[key] !== undefined) detail[key] = e[key];
+      }
+      if (e.type === "response.done") {
+        detail.status = e.response.status;
+        detail.status_details = e.response.status_details;
+      }
+      if (e.type === "frankie.metrics") {
+        detail.metrics = {};
+        for (const key of ["generated_tokens", "finish_stop_origin", "audio_seconds", "wall_seconds",
+          "decode_tok_s", "cached_tokens", "new_prefill_tokens", "session_cache_hit", "mode",
+          "speculative_depth", "accepted_drafts", "drafted_tokens", "repetition_stop_triggered",
+          "repetition_stop_reason", "loop_guard", "thinking_guard"])
+          if (e.metrics[key] !== undefined) detail.metrics[key] = e.metrics[key];
+      }
+      record(e.type, detail);
+    }
     function send(event) {
       if (ws?.readyState === 1) ws.send(JSON.stringify(event));
     }
@@ -410,7 +435,7 @@
       }, 6000);
     }
     async function onEvent(e) {
-      record(e.type, { response_id: e.response_id, item_id: e.item_id });
+      recordServerEvent(e);
       if (e.type === "session.created") {
         settings();
         return;
@@ -476,6 +501,16 @@
           pendingText = false;
           send({ type: "response.create" });
         }
+        return;
+      }
+      if (
+        e.type === "conversation.item.input_audio_transcription.completed"
+      ) {
+        message(e.item_id, "user", e.transcript);
+        return;
+      }
+      if (e.type === "response.output_audio_transcript.done" || e.type === "response.output_text.done") {
+        message(e.item_id, "assistant", e.transcript ?? e.text);
         return;
       }
       if (
