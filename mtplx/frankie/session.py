@@ -984,6 +984,10 @@ class Session:
         self.metrics["barge_ins"] += 1
         text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
         if run.item is not None:
+            # Keep historical cutoffs stable when the bounded private draft is
+            # evicted. Removing old notices invalidates the cached prompt prefix
+            # and loses the reason that an earlier answer stopped mid-thought.
+            run.item["_playback_interrupted"] = True
             index = next((i for i, item in enumerate(self.items) if item is run.item), -1)
             newest = max((i for i, item in enumerate(self.items)
                           if "_interrupted_draft" in item), default=-1)
