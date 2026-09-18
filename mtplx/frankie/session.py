@@ -63,6 +63,10 @@ class Response:
     interrupted: bool = False
     first_audio_at: float = 0.0
     task_results: set = field(default_factory=set)
+    tool_candidates: dict = field(default_factory=dict)
+    tool_items: dict = field(default_factory=dict)
+    tool_error: str | None = None
+    generation_failed: bool = False
 
 
 class Session:
@@ -282,16 +286,20 @@ class Session:
             part=public(run.item["content"][0]),
         )
         run.ready.set()
+        for key, call in tuple(run.tool_candidates.items()):
+            self.publish_tool(run, key, call)
 
     def emit(self, run, kind, value):
         # Transcription must not stall speculative brain prefill. Hold its
         # event on the event-loop side until the same utterance is committed.
-        if kind != "input_transcript":
+        if kind not in {"input_transcript", "tool_call"}:
             while not run.ready.wait(0.01):
                 if run.abort.is_set() or self.closed:
                     return
         if run.abort.is_set() or self.closed:
             return
+        if kind == "tool_call":
+            value = copy.deepcopy(value)
         if kind == "audio":
             value = base64.b64encode(
                 np.clip(value * 32767, -32768, 32767).astype("<i2").tobytes()
@@ -300,6 +308,9 @@ class Session:
 
     def publish(self, run, kind, value):
         if run.abort.is_set() or self.closed:
+            return
+        if kind == "tool_call":
+            self.publish_tool(run, tuple(value["key"]), value["call"])
             return
         if kind == "input_transcript":
             if run.visible:
@@ -332,6 +343,58 @@ class Session:
             )
         elif kind == "chunk":
             run.chunks.append(value)
+
+    def publish_tool(self, run, key, call, *, terminal=False):
+        """One event-loop admission point; candidates are not external work."""
+        if (self.closed or run.abort.is_set() or run.done or run.generation_failed
+                or self.current is not run or run.tool_error):
+            return
+        previous = run.tool_candidates.get(key)
+        if previous is not None and previous != call:
+            run.tool_error = "A committed tool call changed after publication."
+        elif previous is None:
+            if (run.settings["background_tasks"]
+                    and len(run.tool_candidates) >= self.task_ledger.max_pending):
+                run.tool_error = "Too many tool calls in one response."
+            else:
+                run.tool_candidates[key] = copy.deepcopy(call)
+        if run.tool_error:
+            run.abort.set()
+            run.ready.set()
+            return
+        if key in run.tool_items:
+            return
+        if (not run.visible or not run.ready.is_set()
+                or (not terminal and not (run.settings["background_tasks"]
+                                          and self.settings["background_tasks"]))):
+            return
+        function = call["function"]
+        item = {
+            "id": identifier("item"), "type": "function_call", "status": "completed",
+            "call_id": call.get("id") or identifier("call"),
+            "name": function["name"], "arguments": function["arguments"],
+        }
+        # Parser-generated IDs are stable within this response, but must not
+        # collide with any historical call, including evicted ledger entries.
+        while any(i.get("call_id") == item["call_id"] for i in self.items):
+            item["call_id"] = identifier("call")
+        if self.settings["background_tasks"]:
+            try:
+                task = self.task_ledger.register(item, self.input_revision, run.id)
+            except ValueError as exc:
+                run.tool_error = str(exc)
+                run.abort.set()
+                run.ready.set()
+                return
+            self.event("frankie.task.updated", task=task.public())
+        run.tool_items[key] = item
+        self.items.append(item)
+        index = len(run.tool_items)
+        self.event("response.output_item.added", response_id=run.id, output_index=index, item=item)
+        self.event("response.function_call_arguments.done", response_id=run.id,
+                   item_id=item["id"], call_id=item["call_id"], name=item["name"],
+                   arguments=item["arguments"], output_index=index)
+        self.event("response.output_item.done", response_id=run.id, output_index=index, item=item)
 
     def transcribed(self, item, index, transcript):
         if self.closed or not any(i is item for i in self.items):
@@ -462,76 +525,33 @@ class Session:
 
                 traceback.print_exc()
                 error = str(exc)
+        run.generation_failed = error is not None
         # Tool-only replies and immediate EOS can finish without emit's gate.
         # Retain their result until commitment, leaving the inference owner free.
         while not run.ready.is_set() and not run.abort.is_set() and not self.closed:
             await asyncio.sleep(0.01)
-        run.done = True
-        if self.closed:
+        if self.closed or not run.visible:
+            run.done = True
             return
-        if not run.visible:
-            return
-        status = (
-            "cancelled" if run.abort.is_set() else ("failed" if error else "completed")
-        )
-        output = []
-        if run.item is not None:
-            run.item["status"] = "completed" if status == "completed" else "incomplete"
-            output.append(public(run.item))
+        error = run.tool_error or error
+        status = "failed" if error else ("cancelled" if run.abort.is_set() else "completed")
         if result and status == "completed":
-            from .thinking import public_tool_calls
+            tool_events = result.get("tool_events")
+            if tool_events is None:
+                from .thinking import public_tool_calls
 
-            calls = public_tool_calls(
-                result["raw_text"],
-                self.engine.tokenizer,
-                run.settings["tools"],
-                starts_in_thinking=run.settings.get("thinking", "off") != "off",
-            )
-            for call in calls:
-                function = call["function"]
-                item = {
-                    "id": identifier("item"),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": call.get("id", identifier("call")),
-                    "name": function["name"],
-                    "arguments": function["arguments"],
-                }
-                if self.settings["background_tasks"]:
-                    # Parser-generated identifiers must never collide with a
-                    # historical invocation, including evicted ledger entries.
-                    while any(i.get("call_id") == item["call_id"] for i in self.items):
-                        item["call_id"] = identifier("call")
-                    try:
-                        task = self.task_ledger.register(item, self.input_revision, run.id)
-                    except ValueError as exc:
-                        error, status = str(exc), "failed"
-                        break
-                    self.event("frankie.task.updated", task=task.public())
-                self.items.append(item)
-                output.append(item)
-                self.event(
-                    "response.output_item.added",
-                    response_id=run.id,
-                    output_index=len(output) - 1,
-                    item=item,
-                )
-                self.event(
-                    "response.function_call_arguments.done",
-                    response_id=run.id,
-                    item_id=item["id"],
-                    call_id=item["call_id"],
-                    name=item["name"],
-                    arguments=item["arguments"],
-                    output_index=len(output) - 1,
-                )
-                self.event(
-                    "response.output_item.done",
-                    response_id=run.id,
-                    output_index=len(output) - 1,
-                    item=item,
-                )
-            if result["finish_reason"] == "length":
+                tool_events = [
+                    {"key": ("terminal", index), "call": call}
+                    for index, call in enumerate(public_tool_calls(
+                        result["raw_text"], self.engine.tokenizer, run.settings["tools"],
+                        starts_in_thinking=run.settings.get("thinking", "off") != "off",
+                    ))
+                ]
+            for event in tool_events:
+                self.publish_tool(run, tuple(event["key"]), event["call"], terminal=True)
+            if run.tool_error:
+                error, status = run.tool_error, "failed"
+            if status == "completed" and result["finish_reason"] == "length":
                 status = "incomplete"
             self.event(
                 "frankie.metrics",
@@ -543,6 +563,13 @@ class Session:
                     "wall_seconds": result["seconds"],
                 },
             )
+        run.done = True
+        output = []
+        if run.item is not None:
+            run.item["status"] = "completed" if status == "completed" else "incomplete"
+            output.append(public(run.item))
+        # Speech cancellation/failure never erases already issued external work.
+        output.extend(public(item) for item in run.tool_items.values())
         common = {
             "response_id": run.id,
             "item_id": run.item_id,

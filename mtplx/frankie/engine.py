@@ -26,6 +26,7 @@ from mtplx.vision.splice import VisionSplice
 from .audio import AudioModels
 from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
 from .sampling import brain_sampler, thinking_guard
+from .thinking import public_tool_calls
 
 
 class Frankie:
@@ -242,6 +243,9 @@ class Frankie:
         sent_text = ""
         in_thinking = settings.get("thinking", "off") != "off"
         in_tool = False
+        tool_start = None
+        native_tools = False
+        tool_events = []
         audio_seconds = 0.0
         audio_start = None
         chunk_text = ""
@@ -330,8 +334,14 @@ class Frankie:
                 return True
             return False
 
+        def flush_text():
+            nonlocal sent_text
+            if all_text != sent_text:
+                emit("text", all_text[len(sent_text) :])
+                sent_text = all_text
+
         def received(tokens, states=None):
-            nonlocal all_text, sent_text, in_thinking, in_tool
+            nonlocal all_text, in_thinking, in_tool, tool_start, native_tools
             check_abort()
             for token, state in zip(
                 tokens, states if states is not None else repeat(None)
@@ -353,9 +363,23 @@ class Frankie:
                     continue
                 if value == "<tool_call>":
                     chunk()
+                    # Only committed public native envelopes are eligible.
+                    # Nested envelopes stay invalid rather than salvaging one.
+                    tool_start = None if in_tool else len(text_ids) - 1
+                    native_tools = True
                     in_tool = True
                     continue
                 if value == "</tool_call>":
+                    if in_tool and tool_start is not None and settings.get("background_tasks"):
+                        raw = self.tokenizer.decode(text_ids[tool_start:])
+                        for index, call in enumerate(public_tool_calls(
+                            raw, self.tokenizer, settings.get("tools", [])
+                        )):
+                            event = {"key": (len(text_ids), index), "call": call}
+                            tool_events.append(event)
+                            flush_text()
+                            emit("tool_call", event)
+                    tool_start = None
                     in_tool = False
                     continue
                 if in_tool:
@@ -366,9 +390,7 @@ class Frankie:
                     speech_states.append(state)
                 detokenizer.add_token(token)
                 all_text += detokenizer.last_segment
-            if all_text != sent_text:
-                emit("text", all_text[len(sent_text) :])
-                sent_text = all_text
+            flush_text()
             step_audio()
             if not mouth_enabled:
                 background = getattr(self, "background_step", None)
@@ -443,6 +465,10 @@ class Frankie:
                 "audio_seconds": audio_seconds,
                 "chunks": marks,
                 "seconds": time.monotonic() - started,
+                # Reuse the same parsed identities at response completion.
+                # Other backends/envelopes retain the existing terminal parser.
+                **({"tool_events": tool_events}
+                   if native_tools and settings.get("background_tasks") else {}),
             }
         finally:
             if speaker is not None:
