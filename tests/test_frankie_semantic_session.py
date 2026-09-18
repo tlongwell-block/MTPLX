@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from test_frankie_background_session import call, output, setup, user, wait_for
 
-from mtplx.frankie.session import Response
+from mtplx.frankie.session import Response, public
 
 
 class Listener:
@@ -94,7 +94,7 @@ def test_adaptation_and_failure_both_remove_unheard_text_before_replanning(error
         await task
         await wait_for(lambda: len(e.calls) == 1)
         assert e.calls[0][0]["content"][0]["transcript"] == "Heard."
-        assert "Never heard." not in str(e.calls[0])
+        assert "Never heard." not in str(public(e.calls[0]))
         assert run.abort.is_set() and not s.semantic_pending
         audio = next(p for p in item["content"] if p["type"] == "input_audio")
         assert audio.get("_listener_transcript") == ("No, Thursday." if error is None else None)

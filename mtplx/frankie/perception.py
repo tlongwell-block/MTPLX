@@ -8,12 +8,15 @@ import asyncio
 import time
 from dataclasses import replace
 
+import numpy as np
+
 from .interaction import (
     MAX_OBSERVATION_SECONDS,
     ListenerObservation,
     parse_compact_decision,
     semantic_messages,
 )
+from .listening import PrefixEvidence
 
 
 class RealtimeListener:
@@ -21,28 +24,76 @@ class RealtimeListener:
         self.session, self.service = session, service
         self.job = None
         self.revision = 0
+        self._generation = 0
 
     def cancel(self):
+        self._generation += 1
         if self.job is not None:
             self.job.cancelled.set()
             self.job.ready.set()
 
-    async def classify(self, item, run, *, fragments=None):
+    async def _admit(self):
         self.cancel()
-        # Cancelled work is released by the inference owner, never by the
-        # websocket thread while a model slice still owns its cache.
+        generation = self._generation
+        # Only the inference owner retires work/caches. Cancellation alone does
+        # not free admission, including when a final turn supersedes a prefix.
         deadline = time.monotonic() + 3
         while any(j.internal for j in tuple(self.service.jobs)):
+            if self._generation != generation:
+                raise RuntimeError("Listener admission was cancelled.")
             if time.monotonic() >= deadline or self.session.closed:
                 raise TimeoutError("Listener admission deadline.")
             await asyncio.sleep(0.01)
+        if self.session.closed or self._generation != generation:
+            raise RuntimeError("Listener admission was cancelled.")
         self.revision += 1
+
+    @staticmethod
+    def _data():
+        return {"messages": [], "max_tokens": 6, "temperature": 0, "seed": 0,
+                "thinking": "off", "enable_thinking": False, "tools": []}
+
+    async def _run(self, data, prepare, *, prepare_only=False):
+        started = time.monotonic()
+        job = (self.service.submit_prepare(prepare) if prepare_only else
+               self.service.submit(data, True, internal=True, prepare=prepare))
+        self.job = job
+        stats = {}
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    event = await job.receive()
+                    if "error" in event:
+                        raise RuntimeError(event["error"])
+                    if "listener_prepare_seconds" in event:
+                        stats["ear_ms"] = event["listener_prepare_seconds"] * 1000
+                    if "finish_reason" in event or "prepared" in event:
+                        stats.update(event.get("usage", {}),
+                                     elapsed_ms=(time.monotonic() - started) * 1000)
+                        return event, stats
+        finally:
+            job.cancelled.set()
+            job.ready.set()
+            # Return only after the actual owner has relinquished the job. A
+            # bounded timeout leaves self.job pointing to unretired work, so a
+            # subsequent admission cannot treat cancellation as free capacity.
+            async with asyncio.timeout(3):
+                while job in self.service.jobs:
+                    await asyncio.sleep(0.01)
+            if self.job is job:
+                self.job = None
+
+    async def classify(self, item, run, *, fragments=None):
+        await self._admit()
         parts = [part for fragment in (fragments or (item,))
                  for part in fragment["content"] if part["type"] == "input_audio"]
         duration_ms = sum(len(part["_pcm"]) * 1000 / part.get("_rate", 24000)
                           for part in parts)
-        if duration_ms > MAX_OBSERVATION_SECONDS * 1000:
-            raise ValueError("Semantic observation exceeds the six-second acoustic budget.")
+        streaming = self.session.settings.get("streaming_listener", "off") in {"observe", "semantic"}
+        limit = 90 if streaming else MAX_OBSERVATION_SECONDS
+        if duration_ms > limit * 1000:
+            raise ValueError("Final listener input exceeds 90 seconds." if streaming else
+                             "Semantic observation exceeds the six-second acoustic budget.")
         heard = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
         observation = ListenerObservation(
             utterance_id=item["id"], revision=self.revision,
@@ -55,8 +106,7 @@ class RealtimeListener:
             pending_work=any(t.status == "running" for t in self.session.task_ledger.tasks.values()),
             assistant_name=self.session.settings.get("assistant_name", "Frankie"),
         )
-        data = {"messages": [], "max_tokens": 6, "temperature": 0, "seed": 0,
-                "thinking": "off", "enable_thinking": False, "tools": []}
+        data = self._data()
         prepared = {}
 
         def prepare(job):
@@ -75,26 +125,56 @@ class RealtimeListener:
             prepared["observation"] = observed
             job.data["messages"] = semantic_messages(observed, compact=True)
 
-        started = time.monotonic()
-        job = self.service.submit(data, True, internal=True, prepare=prepare)
-        self.job = job
-        stats = {}
-        try:
-            async with asyncio.timeout(5):
-                while True:
-                    event = await job.receive()
-                    if "error" in event:
-                        raise RuntimeError(event["error"])
-                    if "listener_prepare_seconds" in event:
-                        stats["ear_ms"] = event["listener_prepare_seconds"] * 1000
-                    if "finish_reason" in event:
-                        observed = prepared["observation"]
-                        decision = parse_compact_decision(event["message"]["content"], observed)
-                        stats.update(event.get("usage", {}),
-                                     elapsed_ms=(time.monotonic() - started) * 1000)
-                        return decision, observed, stats
-        finally:
-            job.cancelled.set()
-            job.ready.set()
-            if self.job is job:
-                self.job = None
+        event, stats = await self._run(data, prepare)
+        observed = prepared["observation"]
+        decision = parse_compact_decision(event["message"]["content"], observed)
+        return decision, observed, stats
+
+    def _hear_prefix(self, snapshot, job, *, compare):
+        if (snapshot.sample_rate not in (16000, 24000) or not snapshot.pcm
+                or len(snapshot.pcm) % 2
+                or snapshot.samples > MAX_OBSERVATION_SECONDS * snapshot.sample_rate):
+            raise ValueError("Invalid or oversized disposable listener PCM.")
+        pcm = np.frombuffer(snapshot.pcm, dtype="<i2").astype(np.float32) / 32768
+        previous_samples = snapshot.samples - snapshot.sample_rate * 160 // 1000
+        previous_text = None
+        if compare and previous_samples > 0:
+            if job.cancelled.is_set():
+                raise RuntimeError("Listener observation was cancelled.")
+            _, previous_text = self.session.engine.audio.hear(pcm[:previous_samples], snapshot.sample_rate)
+        else:
+            previous_samples = None
+        if job.cancelled.is_set():
+            raise RuntimeError("Listener observation was cancelled.")
+        _, text = self.session.engine.audio.hear(pcm, snapshot.sample_rate)
+        # Both temporary feature arrays die here; no conversation part is read
+        # or mutated, and no partial rows/transcript can poison final input.
+        return PrefixEvidence(snapshot, text, previous_text, previous_samples)
+
+    async def classify_prefix(self, snapshot, *, heard_text, pending_work, assistant_name):
+        await self._admit()
+        prepared = {}
+
+        def prepare(job):
+            evidence = self._hear_prefix(snapshot, job, compare=True)
+            observation = ListenerObservation(
+                utterance_id=snapshot.utterance_id, revision=snapshot.revision,
+                observed_ms=round(snapshot.observed_ms), user_text=evidence.text,
+                assistant_heard_text=heard_text, assistant_speaking=True,
+                user_speaking=not snapshot.final, is_final=snapshot.final,
+                transcript_stable=evidence.stable(160),
+                speech_ms=round(snapshot.samples * 1000 / snapshot.sample_rate),
+                pending_work=pending_work, assistant_name=assistant_name,
+            )
+            prepared.update(evidence=evidence, observation=observation)
+            job.data["messages"] = semantic_messages(observation, compact=True)
+
+        event, stats = await self._run(self._data(), prepare)
+        decision = parse_compact_decision(event["message"]["content"], prepared["observation"])
+        return decision, prepared["evidence"], stats
+
+    async def recheck_prefix(self, snapshot):
+        await self._admit()
+        event, _ = await self._run({}, lambda job: self._hear_prefix(snapshot, job, compare=False),
+                                   prepare_only=True)
+        return event["prepared"]

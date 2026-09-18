@@ -16,6 +16,8 @@ import numpy as np
 
 from .audio import resample
 from .interaction import MAX_OBSERVATION_SECONDS
+from .interruption import capture_draft
+from .listening import ListeningDecision, StreamingListener
 from .tasks import (
     BACKGROUND_TASK_INSTRUCTIONS,
     TaskLedger,
@@ -57,6 +59,7 @@ class Response:
     emitted_ms: float = 0.0
     playback_finished: bool = False
     playback_paused: bool = False
+    interrupted: bool = False
     first_audio_at: float = 0.0
     task_results: set = field(default_factory=set)
 
@@ -82,6 +85,9 @@ class Session:
         self.unhandled_task_results = set()
         self.playback_runs = {}
         self.listener = None
+        self.prefix_listener = StreamingListener()
+        self.prefix_task = None
+        self.prefix_yielded = False
         self.overlap_run = None
         self.overlap_prefix_ms = 0
         self.semantic_pending = 0
@@ -102,6 +108,7 @@ class Session:
             "assistant_name": "Frankie",
             "playback_feedback": False,
             "playback_pause": False,
+            "streaming_listener": "off",
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
@@ -168,6 +175,7 @@ class Session:
                 "playback_feedback": True,
                 "playback_pause": self.settings["playback_pause"],
                 "interruption_policy": self.settings["interruption_policy"],
+                "streaming_listener": self.settings["streaming_listener"],
                 "semantic_listener_available": self.listener is not None,
                 "assistant_name": self.settings["assistant_name"],
             },
@@ -384,6 +392,13 @@ class Session:
             if input_item is not None and input_item not in self.items
             else []
         )
+        # Freeze the playback frontier for this generation. Device callbacks
+        # may refine the authoritative old item while this prompt is queued.
+        # User audio remains shared for the existing immutable feature cache.
+        history = [{**item, "content": [dict(p) for p in item.get("content", [])],
+                    **({"_interrupted_draft": dict(item["_interrupted_draft"])}
+                       if "_interrupted_draft" in item else {})}
+                   if item.get("role") == "assistant" else item for item in history]
         if self.settings["background_tasks"]:
             # An already captured audio turn gets its answer first. A
             # result queued while that turn was being classified belongs to a
@@ -577,8 +592,76 @@ class Session:
 
     def invalidate_semantics(self):
         self.semantic_epoch += 1
+        self.cancel_prefix()
         if self.listener is not None:
             self.listener.cancel()
+
+    def cancel_prefix(self):
+        self.prefix_listener.cancel()
+        if self.prefix_task is not None and self.prefix_task is not asyncio.current_task():
+            self.prefix_task.cancel()
+
+    def append_prefix(self, frame):
+        if (self.overlap_run is None or self.settings["streaming_listener"] == "off"
+                or self.settings["interruption_policy"] != "semantic"):
+            return
+        observer = self.prefix_listener
+        if not observer.active:
+            return
+        observer.append(np.clip(frame * 32767, -32768, 32767).astype("<i2").tobytes())
+        ticket = observer.request()
+        if ticket is not None:
+            run = self.overlap_run
+            heard = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
+            pending = any(t.status == "running" for t in self.task_ledger.tasks.values())
+            self.prefix_task = self.spawn(self.observe_prefix(
+                ticket, run, heard, pending, self.settings["assistant_name"]))
+            def retired(task):
+                # Cancellation before the coroutine first runs skips its
+                # finally block; no owner job exists in that case.
+                observer.retire(ticket)
+                if self.prefix_task is task:
+                    self.prefix_task = None
+            self.prefix_task.add_done_callback(retired)
+
+    async def observe_prefix(self, ticket, run, heard, pending, name):
+        """A disposable prefix can yield the floor, never finish the user's turn."""
+        observer = self.prefix_listener
+        try:
+            decision, evidence, stats = await self.listener.classify_prefix(
+                ticket, heard_text=heard, pending_work=pending, assistant_name=name)
+            # Legacy compact observations make no addressee/sufficiency claim.
+            qualified = decision if isinstance(decision, ListeningDecision) else ListeningDecision(decision.action)
+            recheck = None
+            if qualified.intent == "take_floor" and qualified.sufficient_evidence:
+                latest = observer.refresh(ticket)
+                if latest is not None and latest.samples != ticket.samples:
+                    recheck = await self.listener.recheck_prefix(latest)
+            result = observer.complete(ticket, evidence, qualified, recheck=recheck)
+            apply = (result.apply and self.current is run and not run.abort.is_set()
+                     and not run.playback_finished and self.listening
+                     and self.settings["turn_detection"].get("interrupt_response", True))
+            self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
+                       response_id=run.id, action=result.action, gate=result.reason,
+                       metrics=stats, apply=apply, confidence=None)
+            if apply:
+                self.rollback_unheard(run)
+                # Keep the complete captured PCM. Ordinary endpointing and a
+                # fresh generation handle what the user ultimately says.
+                self.overlap_run = None
+                self.overlap_prefix_ms = 0
+                self.prefix_yielded = True
+                self.cancel_prefix()
+                self.event("frankie.interaction", state="yield",
+                           reason="User took the floor; listening for the complete turn.")
+        except (ValueError, RuntimeError, TimeoutError, OverflowError) as exc:
+            self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
+                       response_id=run.id, action="wait", gate="unavailable",
+                       reason=str(exc), apply=False)
+        finally:
+            observer.retire(ticket)
+            if self.prefix_task is asyncio.current_task():
+                self.prefix_task = None
 
     def accept_input(self, *, semantic_overlap=False):
         """Prioritize new input without losing an already requested result reply."""
@@ -739,6 +822,10 @@ class Session:
                    response_id=run.id, item_id=run.item_id)
 
     def rollback_unheard(self, run):
+        if run.interrupted:
+            return
+        run.interrupted = True
+        draft = capture_draft(run)
         run.playback_paused = False
         run.abort.set()
         run.ready.set()
@@ -749,6 +836,9 @@ class Session:
         self.metrics["barge_ins"] += 1
         text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
         if run.item is not None:
+            for item in self.items:
+                item.pop("_interrupted_draft", None)
+            run.item["_interrupted_draft"] = draft
             run.item["content"] = [{"type": "output_audio", "transcript": text}]
             run.text = text
 
@@ -873,11 +963,30 @@ class Session:
                 self.overlap_prefix_ms = self.fragment_audio_ms(self.preceding_overlaps(
                     self.overlap_run, self.clock_ms)) if self.overlap_run is not None else 0
                 self.listening = True
+                self.prefix_yielded = False
                 self.capture_context = self.next_context()
                 self.speech_start_ms = self.clock_ms
                 self.frames = list(self.pre)
                 self.silence = 0
                 self.speech_id = identifier("item")
+                if (self.overlap_run is not None
+                        and self.settings["interruption_policy"] == "semantic"
+                        and self.settings["streaming_listener"] != "off"):
+                    self.prefix_listener.begin(self.overlap_run.id, self.speech_id,
+                                               sample_rate=rate,
+                                               start_ms=max(0, round(self.clock_ms - self.overlap_prefix_ms
+                                                                    - 32 * (len(self.pre) + 1))))
+                    # A short acoustic pause must not remove an unresolved
+                    # negation, quoted-speech preface, or named addressee.
+                    for fragment in self.preceding_overlaps(self.overlap_run, self.clock_ms):
+                        for part in fragment["content"]:
+                            if part["type"] == "input_audio":
+                                pcm = resample(part["_pcm"], part.get("_rate", rate), rate)
+                                self.prefix_listener.append(np.clip(pcm * 32767, -32768, 32767)
+                                                            .astype("<i2").tobytes())
+                    for prefix_frame in self.pre:
+                        self.prefix_listener.append(np.clip(prefix_frame * 32767, -32768, 32767)
+                                                    .astype("<i2").tobytes())
                 self.event(
                     "input_audio_buffer.speech_started",
                     audio_start_ms=max(0, self.clock_ms - 32 * (len(self.pre) + 1)),
@@ -885,9 +994,11 @@ class Session:
                 )
             if self.listening:
                 self.frames.append(frame)
+                self.append_prefix(frame)
                 buffered_samples = sum(len(x) for x in self.frames)
                 if (self.overlap_run is not None
                         and self.settings["interruption_policy"] == "semantic"
+                        and self.settings["streaming_listener"] == "off"
                         and self.overlap_prefix_ms + buffered_samples * 1000 / rate
                         > MAX_OBSERVATION_SECONDS * 1000):
                     # Match the listener's six-second acoustic budget, including
@@ -946,6 +1057,7 @@ class Session:
                     if (
                         self.silence >= 96
                         and self.spec is None
+                        and not self.prefix_yielded
                         and can_start
                         and td.get("create_response", True)
                     ):
@@ -963,6 +1075,7 @@ class Session:
                         self.turn is None
                         or self.turn.release(self.clock_ms, self.silence)
                     ):
+                        self.cancel_prefix()
                         self.event(
                             "input_audio_buffer.speech_stopped",
                             audio_end_ms=self.clock_ms,
@@ -1049,6 +1162,13 @@ class Session:
                 if type(extensions["playback_pause"]) is not bool:
                     raise ValueError("playback_pause must be a boolean.")
                 new["playback_pause"] = extensions["playback_pause"]
+            if "streaming_listener" in extensions:
+                mode = extensions["streaming_listener"]
+                if mode not in {"off", "observe", "semantic"}:
+                    raise ValueError("Use off, observe, or semantic streaming_listener.")
+                if mode != "off" and not hasattr(self.listener, "classify_prefix"):
+                    raise ValueError("Streaming listener is unavailable in this server.")
+                new["streaming_listener"] = mode
             if "assistant_name" in extensions:
                 name = extensions["assistant_name"]
                 if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
@@ -1136,6 +1256,7 @@ class Session:
                         ledger.complete(item["call_id"])
                 self.task_ledger = ledger
             self.settings = new
+            self.prefix_listener.allow_control = new["streaming_listener"] == "semantic"
             if (new["interruption_policy"] != "semantic"
                     or not new["playback_pause"] or not new["playback_feedback"]
                     or new["turn_detection"] is None
@@ -1246,6 +1367,11 @@ class Session:
             if self.speech_paused:
                 self.event("frankie.response.skipped", reason="user_requested_silence")
                 return
+            if self.settings["streaming_listener"] != "off" and self.listening:
+                if self.settings["background_tasks"] and self.unhandled_task_results:
+                    self.queued_task_response = True
+                self.event("frankie.response.skipped", reason="user_turn_pending")
+                return
             if self.settings["background_tasks"]:
                 # An explicit response request reserves available results even
                 # when an already captured user turn must be answered first.
@@ -1281,6 +1407,8 @@ class Session:
                 raise ValueError("Response id is not active.")
             self.queued_task_response = False
             self.invalidate_semantics()
+            self.overlap_run = None
+            self.overlap_prefix_ms = 0
             self.speech_paused = True
             audible = self.audible_response()
             if audible is not None:
@@ -1367,19 +1495,23 @@ class Session:
             if item is None or item.get("role") != "assistant":
                 raise ValueError("Unknown assistant audio item.")
             if run and run.item_id == item["id"]:
-                ms = max(0, int(event["audio_end_ms"]))
+                ms = event["audio_end_ms"]
+                if type(ms) is not int or not 0 <= ms <= run.emitted_ms + 1:
+                    raise ValueError("Invalid playback truncation position.")
                 if not (run.playback_finished and ms >= run.emitted_ms - 1):
-                    run.abort.set()
-                    run.ready.set()
-                    run.played_ms = ms
-                    text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= ms)
-                    item["content"] = [
-                        {
-                            "type": "output_audio",
-                            "transcript": text + " [interrupted by the user]",
-                        }
-                    ]
-                    run.text = text
+                    # Playback feedback is monotonic. A late old notification
+                    # cannot undo already confirmed history or restore a draft
+                    # evicted by a more recent interruption.
+                    run.played_ms = max(run.played_ms, ms)
+                    if not run.interrupted:
+                        self.rollback_unheard(run)
+                    else:
+                        if "_interrupted_draft" in item:
+                            item["_interrupted_draft"] = capture_draft(run)
+                        text = " ".join(c["text"] for c in run.chunks
+                                        if c["end_ms"] <= run.played_ms)
+                        item["content"] = [{"type": "output_audio", "transcript": text}]
+                        run.text = text
             self.event(
                 "conversation.item.truncated",
                 item_id=item["id"],
@@ -1407,6 +1539,7 @@ class Session:
 
     async def close(self):
         self.closed = True
+        self.cancel_prefix()
         if self.playback_wake is not None:
             self.playback_wake.cancel()
             self.playback_wake = None

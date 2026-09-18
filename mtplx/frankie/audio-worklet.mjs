@@ -75,6 +75,7 @@ class DuplexAudio extends AudioWorkletProcessor {
         this.queued += data.pcm.length;
       }
       if (data.type === "clear") {
+        if (data.responseId && this.item?.responseId !== data.responseId) return;
         this.pausedResponseId = null;
         if (this.item) this.blocked.add(this.item.itemId);
         if (this.blocked.size > 4096) {

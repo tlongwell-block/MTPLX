@@ -24,6 +24,7 @@ from mtplx.vision.processing import decode_image, preprocess_images
 from mtplx.vision.splice import VisionSplice
 
 from .audio import AudioModels
+from .interruption import draft_notice
 from .sampling import brain_sampler, thinking_guard
 
 
@@ -127,6 +128,9 @@ class Frankie:
                         parts.append("Speech transcript (may contain errors): "
                                      + part["_listener_transcript"])
             messages.append({"role": item["role"], "content": "\n".join(parts)})
+            if item.get("_interrupted_draft") is not None:
+                messages.append({"role": "system", "content": draft_notice(
+                    item["_interrupted_draft"])})
         tools = [
             {
                 "type": "function",

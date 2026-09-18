@@ -89,6 +89,8 @@ def test_truncate_preserves_only_completed_heard_chunks():
         run = Response(
             visible=True,
             settings=s.settings,
+            emitted_ms=1200,
+            text="First. Never heard.",
             item={
                 "id": "answer",
                 "type": "message",
@@ -110,9 +112,7 @@ def test_truncate_preserves_only_completed_heard_chunks():
                 "audio_end_ms": 600,
             }
         )
-        assert (
-            run.item["content"][0]["transcript"] == "First. [interrupted by the user]"
-        )
+        assert run.item["content"][0]["transcript"] == "First."
         assert run.abort.is_set()
 
     asyncio.run(setup(check))

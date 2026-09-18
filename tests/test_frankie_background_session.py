@@ -12,7 +12,7 @@ pytest.importorskip("soundfile")
 pytest.importorskip("scipy")
 import numpy as np
 
-from mtplx.frankie.session import Session
+from mtplx.frankie.session import Session, public
 
 
 class Engine:
@@ -265,7 +265,7 @@ def test_playback_feedback_requires_valid_monotonic_actual_drain_and_retains_old
                 "audio_end_ms": 1000,
             }
         )
-        assert "interrupted" not in str(run.item)
+        assert "interrupted" not in str(public(run.item))
         assert not s.current.abort.is_set()
 
     asyncio.run(setup(check))

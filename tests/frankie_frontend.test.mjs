@@ -54,7 +54,7 @@ function browser() {
   };
   get("thinking").value = "off";
   get("speak").checked = true;
-  get("mode").value = "v4";
+  get("mode").value = "v5";
   const context = vm.createContext({
     document: { getElementById: get, createElement: element }, window: {},
     performance: { now: () => now },
@@ -161,7 +161,7 @@ test("baseline sessions do not opt into experimental controls", () => {
   const b = browser();
   b.get("mode").value = "baseline"; b.api.settings();
   assert.equal(b.sent.at(-1).session.frankie, undefined);
-  b.get("mode").value = "v4"; b.api.settings();
+  b.get("mode").value = "v5"; b.api.settings();
   assert.equal(b.sent.at(-1).session.frankie.interruption_policy, "semantic");
   assert.equal(b.sent.at(-1).session.frankie.background_tasks, true);
 });

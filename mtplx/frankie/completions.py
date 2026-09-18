@@ -43,6 +43,7 @@ class Job:
         self.cached_tokens = 0
         self.internal = False
         self.prepare_callback = None
+        self.prepare_only = False
         self.bank = None
 
     def emit(self, value):
@@ -75,7 +76,9 @@ class Completions:
         self.driver = None
         self.listener_bank = None
 
-    def submit(self, data, chat, *, internal=False, prepare=None):
+    def submit(self, data, chat, *, internal=False, prepare=None, prepare_only=False):
+        if prepare_only and (not internal or not callable(prepare)):
+            raise ValueError("Prepare-only work requires an internal owner callback.")
         # A bounded listener request shares the model owner, but cannot be
         # starved by client HTTP admission. It never duplicates model weights.
         jobs = tuple(self.jobs)  # The inference owner can retire jobs concurrently.
@@ -86,12 +89,33 @@ class Completions:
         job = Job(data, chat, self.loop)
         job.internal = internal
         job.prepare_callback = prepare
+        job.prepare_only = prepare_only
         self.jobs.add(job)
         (self.pending.appendleft if internal else self.pending.append)(job)
         self.engine.background_step = self.voice_step
         if self.driver is None or self.driver.done():
             self.driver = asyncio.create_task(self.drive())
         return job
+
+    def submit_prepare(self, callback):
+        """One bounded internal owner operation, with no brain warmup/prefill."""
+        return self.submit({}, True, internal=True, prepare=callback, prepare_only=True)
+
+    def run_preparation(self, job):
+        try:
+            if not job.cancelled.is_set():
+                started = time.monotonic()
+                value = job.prepare_callback(job)
+                if not job.cancelled.is_set():
+                    job.done = True
+                    job.emit({"prepared": value,
+                              "listener_prepare_seconds": time.monotonic() - started})
+        except Exception as exc:  # noqa: BLE001 — owner callback errors cross this job boundary.
+            if not job.cancelled.is_set():
+                job.emit({"error": str(exc)})
+        finally:
+            job.prepare_callback = None
+            self.jobs.discard(job)
 
     async def drive(self):
         while self.jobs:
@@ -416,6 +440,14 @@ class Completions:
         features = getattr(model, "_mtplx_feature_stream", None)
         model._mtplx_feature_stream = None
         try:
+            if self.pending and getattr(self.pending[0], "prepare_only", False):
+                self.run_preparation(self.pending.popleft())
+                if not self.jobs:
+                    if self.batch is not None:
+                        self.batch.close()
+                        self.batch = None
+                    self.engine.background_step = None
+                return
             if self.engine.mtp:
                 self.step_mtp(voice)
                 if not self.jobs:

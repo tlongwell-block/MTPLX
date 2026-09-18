@@ -3,7 +3,7 @@
   <meta charset="utf-8" /><meta
     name="viewport"
     content="width=device-width,initial-scale=1"
-  /><title>Frankie · MTPLX</title>
+  /><title>Frankie v5 · MTPLX</title>
   <style>
     :root {
       color-scheme: dark;
@@ -187,7 +187,7 @@
       ><span id="status">Ready to connect</span>
       <label>Mode <select id="mode">
         <option value="baseline">Baseline</option>
-        <option value="v4" selected>v4 experimental</option>
+        <option value="v5" selected>v5 experimental</option>
       </select></label>
     </div>
     <div id="meter"><div id="level"></div></div>
@@ -316,19 +316,20 @@
           ...($("demoTool").checked ? {
             instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information. Briefly acknowledge a lookup, then call the tool. Keep chatting naturally while it runs.",
           } : {}),
-          ...($("mode").value === "v4" ? {
+          ...($("mode").value === "v5" ? {
             frankie: {
               interruption_policy: "semantic",
               playback_feedback: true,
               playback_pause: false,
+              streaming_listener: "observe",
               background_tasks: true,
             },
           } : {}),
         },
       });
     }
-    function clearPlayback() {
-      node?.port.postMessage({ type: "clear", requestId: "interrupt" });
+    function clearPlayback(responseId) {
+      node?.port.postMessage({ type: "clear", requestId: "interrupt", responseId });
     }
     function interaction(state, reason) {
       const labels = {
@@ -505,7 +506,7 @@
         return;
       }
       if (e.type === "frankie.playback.clear") {
-        clearPlayback();
+        clearPlayback(e.response_id);
         return;
       }
       if (e.type === "frankie.playback.pause" || e.type === "frankie.playback.resume") {
@@ -676,7 +677,7 @@
       await audioContext?.close().catch(() => {});
       $("start").disabled = false;
       $("mode").disabled = false;
-      $("demoTool").disabled = $("mode").value !== "v4";
+      $("demoTool").disabled = $("mode").value !== "v5";
       $("stop").disabled = true;
       $("interrupt").disabled = true;
       $("send").disabled = true;
@@ -684,7 +685,7 @@
     }
     $("start").onclick = start;
     $("mode").onchange = () => {
-      $("demoTool").disabled = $("mode").value !== "v4";
+      $("demoTool").disabled = $("mode").value !== "v5";
       if ($("demoTool").disabled) $("demoTool").checked = false;
     };
     $("stop").onclick = end;
