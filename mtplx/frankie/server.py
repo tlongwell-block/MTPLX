@@ -96,8 +96,8 @@ def serve(args):
 
     app = FastAPI(lifespan=lifespan)
     from .completions import attach_routes
-    attach_routes(app, lambda: engine, executor, token,
-                  slots=args.http_slots, context_tokens=args.http_ctx_size)
+    completion_service = attach_routes(app, lambda: engine, executor, token,
+                                       slots=args.http_slots, context_tokens=args.http_ctx_size)
 
     @app.get("/health")
     async def health():
@@ -135,6 +135,8 @@ def serve(args):
             await ws.close(code=1013, reason="Another conversation owns Frankie.")
             return
         session = Session(engine, executor, ws)
+        from .perception import RealtimeListener
+        session.listener = RealtimeListener(session, completion_service())
         owner = session
         sender = None
         try:

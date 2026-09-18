@@ -15,6 +15,13 @@ from threading import Event
 import numpy as np
 
 from .audio import resample
+from .interaction import MAX_OBSERVATION_SECONDS
+from .tasks import (
+    BACKGROUND_TASK_INSTRUCTIONS,
+    TaskLedger,
+    project_history,
+    task_notice,
+)
 
 
 def identifier(prefix):
@@ -47,6 +54,10 @@ class Response:
     speech_end_ms: int = 0
     played_ms: int = 0
     merged: bool = False
+    emitted_ms: float = 0.0
+    playback_finished: bool = False
+    first_audio_at: float = 0.0
+    task_results: set = field(default_factory=set)
 
 
 class Session:
@@ -57,10 +68,25 @@ class Session:
         self.items = []
         self.latest_context = (0, "")
         self.capture_context = (0, "")
+        self.capture_task_results = ()
         self.current = None
         self.spec = None
         self.closed = False
         self.tasks = set()
+        self.task_ledger = TaskLedger()
+        self.input_revision = 0
+        self.user_revision = 0
+        self.response_revision = -1
+        self.queued_task_response = False
+        self.unhandled_task_results = set()
+        self.playback_runs = {}
+        self.listener = None
+        self.overlap_run = None
+        self.overlap_prefix_ms = 0
+        self.semantic_pending = 0
+        self.semantic_epoch = 0
+        self.speech_paused = False
+        self.playback_wake = None
         self.outgoing = asyncio.Queue(maxsize=2048)
         self.settings = {
             "instructions": "You are Frankie. Be helpful and concise. Use natural spoken sentences.",
@@ -70,6 +96,10 @@ class Session:
             "context": 131072,
             "tools": [],
             "input_rate": 24000,
+            "background_tasks": False,
+            "interruption_policy": "vad",
+            "assistant_name": "Frankie",
+            "playback_feedback": False,
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.5,
@@ -130,7 +160,14 @@ class Session:
             "type": "realtime",
             "model": "Frankie",
             "object": "realtime.session",
-            "frankie": {"input_context": True},
+            "frankie": {
+                "input_context": True,
+                "background_tasks": self.settings["background_tasks"],
+                "playback_feedback": True,
+                "interruption_policy": self.settings["interruption_policy"],
+                "semantic_listener_available": self.listener is not None,
+                "assistant_name": self.settings["assistant_name"],
+            },
             "output_modalities": self.settings["output_modalities"],
             "instructions": self.settings["instructions"],
             "max_output_tokens": self.settings["max_output_tokens"],
@@ -166,6 +203,7 @@ class Session:
             x["id"] == run.input["id"] for x in self.items
         ):
             self.items.append(run.input)
+            self.accept_input()
             self.event(
                 "input_audio_buffer.committed",
                 item_id=run.input["id"],
@@ -177,6 +215,18 @@ class Session:
                 previous_item_id=None,
             )
         run.visible = True
+        self.response_revision = self.user_revision
+        for call_id in run.task_results:
+            task = self.task_ledger.tasks.get(call_id)
+            if task is not None:
+                task.consumed = True
+        self.unhandled_task_results.difference_update(run.task_results)
+        if not self.unhandled_task_results:
+            self.queued_task_response = False
+        self.playback_runs[run.item_id] = run
+        # Keep a bounded feedback window. Old runs can no longer mutate history.
+        while len(self.playback_runs) > 16:
+            del self.playback_runs[next(iter(self.playback_runs))]
         run.committed_at = time.monotonic()
         for value in run.transcripts:
             self.transcribed(*value)
@@ -248,6 +298,10 @@ class Session:
             "content_index": 0,
         }
         if kind == "audio":
+            if not run.first_audio_at:
+                run.first_audio_at = time.monotonic()
+            raw_size = len(value) // 4 * 3 - (2 if value.endswith("==") else value.endswith("="))
+            run.emitted_ms += raw_size * 1000 / (24000 * 2)
             self.event("response.output_audio.delta", delta=value, **common)
         elif kind == "text":
             run.text += value
@@ -298,15 +352,24 @@ class Session:
                     error={"type": "transcription_error", "message": str(exc)},
                 )
 
-    def start(self, input_item=None, *, tentative=False):
+    def start(self, input_item=None, *, tentative=False, deferred_task_results=None):
         if (
             self.current is not None
             and not self.current.done
             and not self.current.abort.is_set()
         ):
             raise ValueError("A response is already active.")
-        if input_item is None and self.items and "_speech_end_ms" in self.items[-1]:
-            input_item = self.items[-1]
+        # A completed generation can still have unheard audio. Explicit new
+        # user/manual responses replace that tail before taking their snapshot;
+        # result-only followups wait for drain in maybe_start_task_response.
+        audible = self.audible_response()
+        if audible is not None:
+            self.rollback_unheard(audible)
+        if input_item is None and self.user_revision > self.response_revision:
+            latest_user = next((item for item in reversed(self.items)
+                                if item.get("role") == "user"), None)
+            if latest_user is not None and "_task_results_at_capture" in latest_user:
+                input_item = latest_user
         run = Response(
             input=input_item,
             settings=copy.deepcopy(self.settings),
@@ -318,6 +381,23 @@ class Session:
             if input_item is not None and input_item not in self.items
             else []
         )
+        if self.settings["background_tasks"]:
+            # An already captured audio turn gets its answer first. A
+            # result queued while that turn was being classified belongs to a
+            # later response, not merely to a snapshot that might ignore it.
+            # Keep authoritative items and their arrival order unchanged.
+            if deferred_task_results is None:
+                captured = (input_item or {}).get("_task_results_at_capture")
+                deferred_task_results = (self.unhandled_task_results - set(captured)
+                                         if captured is not None and self.queued_task_response else ())
+            deferred = self.unhandled_task_results.intersection(deferred_task_results)
+            if deferred:
+                history = [item for item in history
+                           if not (item["type"] == "function_call_output"
+                                   and item["call_id"] in deferred)]
+            history = project_history(history)
+            run.settings["instructions"] += "\n\n" + BACKGROUND_TASK_INSTRUCTIONS
+            run.task_results = self.unhandled_task_results - deferred
         if tentative:
             self.spec = run
             self.metrics["speculations"] += 1
@@ -360,14 +440,15 @@ class Session:
             run.item["status"] = "completed" if status == "completed" else "incomplete"
             output.append(public(run.item))
         if result and status == "completed":
-            from mtplx.server.omlx_bridge.tool_calling import parse_tool_calls
+            from .thinking import public_tool_calls
 
-            parsed = parse_tool_calls(
-                result["raw_text"].rsplit("</think>", 1)[-1],
+            calls = public_tool_calls(
+                result["raw_text"],
                 self.engine.tokenizer,
                 run.settings["tools"],
+                starts_in_thinking=run.settings.get("thinking", "off") != "off",
             )
-            for call in parsed.tool_calls or []:
+            for call in calls:
                 function = call["function"]
                 item = {
                     "id": identifier("item"),
@@ -377,6 +458,17 @@ class Session:
                     "name": function["name"],
                     "arguments": function["arguments"],
                 }
+                if self.settings["background_tasks"]:
+                    # Parser-generated identifiers must never collide with a
+                    # historical invocation, including evicted ledger entries.
+                    while any(i.get("call_id") == item["call_id"] for i in self.items):
+                        item["call_id"] = identifier("call")
+                    try:
+                        task = self.task_ledger.register(item, self.input_revision, run.id)
+                    except ValueError as exc:
+                        error, status = str(exc), "failed"
+                        break
+                    self.event("frankie.task.updated", task=task.public())
                 self.items.append(item)
                 output.append(item)
                 self.event(
@@ -451,6 +543,47 @@ class Session:
         if error:
             response["status_details"] = {"type": "failed", "error": {"message": error}}
         self.event("response.done", response=response)
+        self.maybe_start_task_response()
+
+    def maybe_start_task_response(self):
+        if (
+            self.queued_task_response
+            and self.unhandled_task_results
+            and not self.closed
+            and not self.listening
+            and not self.manual_size
+            and not self.semantic_pending
+            and not self.speech_paused
+            and (not self.user_revision or self.response_revision == self.user_revision)
+            and (self.current is None or self.current.done)
+        ):
+            audible = self.audible_response()
+            if audible is not None:
+                if not self.settings["playback_feedback"]:
+                    if self.playback_wake is not None:
+                        self.playback_wake.cancel()
+                    delay = max(0.01, audible.first_audio_at
+                                + audible.emitted_ms / 1000 + 0.5 - time.monotonic())
+                    self.playback_wake = self.loop.call_later(delay, self.playback_deadline)
+                return
+            self.start()
+
+    def playback_deadline(self):
+        self.playback_wake = None
+        self.maybe_start_task_response()
+
+    def invalidate_semantics(self):
+        self.semantic_epoch += 1
+        if self.listener is not None:
+            self.listener.cancel()
+
+    def accept_input(self, *, semantic_overlap=False):
+        """Prioritize new input without losing an already requested result reply."""
+        self.input_revision += 1
+        self.user_revision += 1
+        self.speech_paused = False
+        if not semantic_overlap:
+            self.invalidate_semantics()
 
     def cancel(self):
         run = self.current
@@ -514,7 +647,9 @@ class Session:
         }
         self.attach_context(item, self.capture_context)
         item["_capture_context"] = self.capture_context
+        item["_task_results_at_capture"] = self.capture_task_results
         if speech_end_ms is not None:
+            item["_speech_start_ms"] = self.speech_start_ms
             item["_speech_end_ms"] = speech_end_ms
         return item
 
@@ -539,6 +674,136 @@ class Session:
         if self.turn is not None:
             self.turn.reset(self.received_ms)
 
+    def audible_response(self):
+        run = self.current
+        if (run is None or not run.visible or run.abort.is_set()
+                or run.playback_finished or run.emitted_ms <= 0):
+            return None
+        if not run.done:
+            return run
+        if self.settings["playback_feedback"]:
+            return run
+        # Clients without playback feedback must not leave a completed response
+        # looking audible forever. The direct demo reports exact drain instead.
+        if run.first_audio_at and time.monotonic() < run.first_audio_at + run.emitted_ms / 1000 + 0.5:
+            return run
+        return None
+
+    def preceding_overlaps(self, run, start_ms, *, before=None):
+        """Recover nearby unfinished fragments, without carrying older turns."""
+        end = next((i for i, item in enumerate(self.items) if item is before), len(self.items))
+        fragments = []
+        for item in reversed(self.items[:end]):
+            if item["type"] in {"function_call", "function_call_output"}:
+                continue  # A background result does not end the user's phrase.
+            if (item.get("_listener_response") != run.id
+                    or item.get("_listener_consumed")
+                    or not 0 <= start_ms - item.get("_speech_end_ms", -2000) <= 1500):
+                break
+            fragments.append(item)
+            start_ms = item["_speech_start_ms"]
+        return tuple(reversed(fragments))
+
+    @staticmethod
+    def fragment_audio_ms(items):
+        return sum(len(part["_pcm"]) * 1000 / part.get("_rate", 24000)
+                   for item in items for part in item["content"]
+                   if part["type"] == "input_audio")
+
+    def schedule_overlap(self, item, run):
+        item["_listener_response"] = run.id
+        fragments = (*self.preceding_overlaps(
+            run, item.get("_speech_start_ms", self.clock_ms), before=item), item)
+        # Reserve before scheduling: generation may finish on the next event
+        # loop callback and must not release a queued tool reply in between.
+        self.semantic_pending += 1
+        return self.spawn(self.resolve_overlap(
+            item, run, self.semantic_epoch, self.user_revision,
+            self.queued_task_response, fragments,
+        ))
+
+    def rollback_unheard(self, run):
+        run.abort.set()
+        run.ready.set()
+        if self.playback_wake is not None:
+            self.playback_wake.cancel()
+            self.playback_wake = None
+        self.event("frankie.playback.clear", response_id=run.id)
+        self.metrics["barge_ins"] += 1
+        text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
+        if run.item is not None:
+            run.item["content"] = [{"type": "output_audio", "transcript": text}]
+            run.text = text
+
+    async def resolve_overlap(self, item, run, epoch, revision, queued_result, fragments):
+        """Apply a final-utterance semantic decision, without dropping input."""
+        def current():
+            return (not self.closed and self.current is run
+                    and epoch == self.semantic_epoch and revision == self.user_revision)
+
+        async def replace_response():
+            if not current() or run.abort.is_set():
+                return
+            self.rollback_unheard(run)
+            while not run.done and current():
+                await asyncio.sleep(0.01)
+            if current() and not self.listening:
+                available = set(fragments[0].get("_task_results_at_capture", ()))
+                deferred = self.unhandled_task_results - available if self.queued_task_response else set()
+                self.start(deferred_task_results=deferred)
+
+        try:
+            decision, observation, stats = await self.listener.classify(item, run, fragments=fragments)
+            for fragment in fragments:
+                for index, part in enumerate(fragment["content"]):
+                    if part["type"] == "input_audio":
+                        self.transcribed(fragment, index, part.get("_transcript", ""))
+            action = decision.action if observation.user_text.strip() else "wait"
+            apply = (self.settings["interruption_policy"] == "semantic"
+                     and current() and not run.abort.is_set())
+            self.event("frankie.interaction.observed", utterance_id=item["id"],
+                       utterance_ids=[fragment["id"] for fragment in fragments],
+                       action=action, confidence=None, evidence="final_ctc_text",
+                       metrics=stats, apply=apply)
+            if not apply:
+                return
+            if action != "wait":
+                for fragment in fragments:
+                    fragment["_listener_consumed"] = True
+            self.event("frankie.interaction", state=action,
+                       reason="Experimental semantic decision on completed speech.")
+            if action == "stop":
+                self.rollback_unheard(run)
+                self.speech_paused = True
+                self.response_revision = revision
+                return
+            if action in {"continue", "wait"}:
+                # This utterance was acknowledged by the listener policy, not
+                # left waiting for a stale client response.create to answer it.
+                self.response_revision = revision
+                if queued_result and self.unhandled_task_results:
+                    self.queued_task_response = True
+                return
+            # Replanning should see the words that informed this decision as
+            # well as the original neural audio features. Ordinary turns and
+            # stale/observation-only decisions do not receive this supplement.
+            for fragment in fragments:
+                for part in fragment["content"]:
+                    if part["type"] == "input_audio":
+                        part["_listener_transcript"] = part.get("_transcript", "")
+            await replace_response()
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            if not current():
+                return  # Superseded/cancelled observations are routine, not UI errors.
+            self.event("frankie.interaction", state="listen", reason=str(exc))
+            # Failure must preserve the utterance and return control to the
+            # normal response path rather than silently losing what was said.
+            if self.settings["interruption_policy"] == "semantic":
+                await replace_response()
+        finally:
+            self.semantic_pending -= 1
+            self.maybe_start_task_response()
+
     async def receive_audio(self, encoded, playback=None):
         raw = base64.b64decode(encoded, validate=True)
         if len(raw) % 2 or len(raw) > 2 * 24000 * 2:
@@ -556,6 +821,9 @@ class Session:
         if td is None:
             if not self.manual_size:
                 self.capture_context = self.next_context()
+                self.capture_task_results = tuple(
+                    call_id for call_id in self.task_ledger.tasks
+                    if call_id in self.unhandled_task_results)
             self.manual_size += len(samples)
             if self.manual_size > 90 * rate:
                 raise ValueError("Audio input exceeds 90 seconds.")
@@ -579,6 +847,13 @@ class Session:
             voiced = probability >= td.get("threshold", 0.5)
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
+                self.invalidate_semantics()
+                self.capture_task_results = tuple(
+                    call_id for call_id in self.task_ledger.tasks
+                    if call_id in self.unhandled_task_results)
+                self.overlap_run = self.audible_response()
+                self.overlap_prefix_ms = self.fragment_audio_ms(self.preceding_overlaps(
+                    self.overlap_run, self.clock_ms)) if self.overlap_run is not None else 0
                 self.listening = True
                 self.capture_context = self.next_context()
                 self.speech_start_ms = self.clock_ms
@@ -592,6 +867,24 @@ class Session:
                 )
             if self.listening:
                 self.frames.append(frame)
+                buffered_samples = sum(len(x) for x in self.frames)
+                if (self.overlap_run is not None
+                        and self.settings["interruption_policy"] == "semantic"
+                        and self.overlap_prefix_ms + buffered_samples * 1000 / rate
+                        > MAX_OBSERVATION_SECONDS * 1000):
+                    # Match the listener's six-second acoustic budget, including
+                    # endpoint/pre-roll padding and unresolved earlier fragments.
+                    # Yield now instead of talking
+                    # over a long user turn until its eventual endpoint. Keep
+                    # all PCM for the ordinary response path after this fallback.
+                    self.invalidate_semantics()
+                    if (not self.overlap_run.abort.is_set()
+                            and not self.overlap_run.playback_finished):
+                        self.rollback_unheard(self.overlap_run)
+                    self.overlap_run = None
+                    self.overlap_prefix_ms = 0
+                    self.event("frankie.interaction", state="yield", fallback="audio_budget",
+                               reason="Long user turn; returning to ordinary turn handling.")
                 if voiced:
                     self.silence = 0
                     self.last_speech_ms = self.clock_ms
@@ -600,13 +893,18 @@ class Session:
                     active = self.current
                     if self.voice_run >= 3 and active and active.visible:
                         if (
-                            not active.done
-                            and not active.abort.is_set()
+                            not active.abort.is_set()
+                            and (not active.done or self.audible_response() is active)
                             and td.get("interrupt_response", True)
+                            and not (self.settings["interruption_policy"] == "semantic"
+                                     and self.overlap_run is not None)
                         ):
-                            self.cancel()
-                            self.metrics["barge_ins"] += 1
-                            self.event("frankie.playback.clear", response_id=active.id)
+                            if active.emitted_ms > 0:
+                                self.rollback_unheard(active)
+                            else:
+                                self.cancel()
+                                self.metrics["barge_ins"] += 1
+                                self.event("frankie.playback.clear", response_id=active.id)
                         # The client may already have cancelled on speech_started.
                         if active.abort.is_set():
                             self.merge_resumed(active)
@@ -617,6 +915,9 @@ class Session:
                         or self.current.done
                         or self.current.abort.is_set()
                     )
+                    semantic_overlap = self.overlap_run is not None and self.settings["interruption_policy"] == "semantic"
+                    if semantic_overlap:
+                        can_start = False
                     if (
                         self.silence >= 96
                         and self.spec is None
@@ -644,8 +945,15 @@ class Session:
                             item_id=self.speech_id,
                         )
                         if self.spec:
+                            observed_item = self.spec.input
                             self.show(self.spec)
                             self.spec = None
+                            # Observation mode retains normal VAD/speculation.
+                            # Its input still needs a listener observation when
+                            # the speculative response is committed here.
+                            if (observed_item is not None and self.overlap_run is not None
+                                    and self.settings["interruption_policy"] == "observe"):
+                                self.schedule_overlap(observed_item, self.overlap_run)
                         else:
                             item = self.audio_item(
                                 np.concatenate(self.frames),
@@ -653,6 +961,7 @@ class Session:
                                 speech_end_ms=self.last_speech_ms,
                             )
                             self.items.append(item)
+                            self.accept_input(semantic_overlap=semantic_overlap)
                             self.event(
                                 "input_audio_buffer.committed",
                                 item_id=item["id"],
@@ -663,14 +972,18 @@ class Session:
                                 item=public(item),
                                 previous_item_id=None,
                             )
+                            if self.overlap_run is not None and self.settings["interruption_policy"] in {"observe", "semantic"}:
+                                self.schedule_overlap(item, self.overlap_run)
                             if td.get("create_response", True) and can_start:
                                 self.start()
-                            else:
+                            elif not semantic_overlap:
                                 self.spawn(self.transcribe_item(item))
                         self.frames = []
                         self.listening = False
                         self.capture_context = (0, "")
                         self.silence = 0
+                        self.overlap_run = None
+                        self.overlap_prefix_ms = 0
                 if sum(len(x) for x in self.frames) > 90 * rate:
                     self.discard_spec()
                     self.frames = []
@@ -702,6 +1015,31 @@ class Session:
                 )
             settings = event["session"]
             new = copy.deepcopy(self.settings)
+            extensions = settings.get("frankie", {})
+            if "playback_feedback" in extensions:
+                if type(extensions["playback_feedback"]) is not bool:
+                    raise ValueError("playback_feedback must be a boolean.")
+                new["playback_feedback"] = extensions["playback_feedback"]
+            if "assistant_name" in extensions:
+                name = extensions["assistant_name"]
+                if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
+                    raise ValueError("assistant_name must contain 1 to 64 characters.")
+                new["assistant_name"] = name.strip()
+            if "interruption_policy" in extensions:
+                policy = extensions["interruption_policy"]
+                if policy not in {"vad", "observe", "semantic"}:
+                    raise ValueError("Use vad, observe, or semantic interruption policy.")
+                if policy != "vad" and self.listener is None:
+                    raise ValueError("Semantic listener is unavailable in this server.")
+                new["interruption_policy"] = policy
+            if "background_tasks" in extensions:
+                if type(extensions["background_tasks"]) is not bool:
+                    raise ValueError("background_tasks must be a boolean.")
+                new["background_tasks"] = extensions["background_tasks"]
+                if not new["background_tasks"] and any(
+                    task.status == "running" for task in self.task_ledger.tasks.values()
+                ):
+                    raise ValueError("Finish or cancel background tasks before disabling them.")
             for key in (
                 "instructions",
                 "output_modalities",
@@ -747,6 +1085,11 @@ class Session:
                 return
             if self.listening or self.manual_size:
                 raise ValueError("Clear pending audio before changing settings.")
+            if (new["interruption_policy"] != "vad"
+                    and self.settings["interruption_policy"] == "vad"):
+                await self.loop.run_in_executor(
+                    self.executor, self.listener.service.warm_listener
+                )
             changed_prefix = any(
                 new[k] != self.settings[k]
                 for k in ("instructions", "thinking", "tools")
@@ -755,24 +1098,41 @@ class Session:
                 await self.loop.run_in_executor(
                     self.executor, lambda: self.engine.warm(new, session_id=self.id)
                 )
+            if new["background_tasks"] and not self.settings["background_tasks"]:
+                ledger = TaskLedger()
+                for item in self.items:
+                    if item["type"] == "function_call":
+                        ledger.register(item, self.input_revision)
+                    elif item["type"] == "function_call_output":
+                        ledger.complete(item["call_id"])
+                self.task_ledger = ledger
             self.settings = new
             self.reset_detectors()
             self.event("session.updated", session=self.info())
         elif kind == "conversation.item.create":
-            if self.current and not self.current.done:
-                raise ValueError(
-                    "Cancel the active response before inserting a conversation item."
-                )
             item = copy.deepcopy(event["item"])
+            interrupt = False
             item.setdefault("id", identifier("item"))
             if any(i["id"] == item["id"] for i in self.items):
                 raise ValueError("Duplicate conversation item id.")
+            if self.current and not self.current.done:
+                if self.settings["background_tasks"] and item["type"] == "function_call_output":
+                    pass  # This result is visible only to a subsequent response snapshot.
+                elif self.settings["background_tasks"] and item.get("role") == "user":
+                    interrupt = True
+                else:
+                    raise ValueError(
+                        "Cancel the active response before inserting a conversation item."
+                    )
             if item["type"] == "message":
                 if item["role"] not in {"user", "assistant", "system"}:
                     raise ValueError("Invalid message role.")
                 for part in item.get("content", []):
                     if part["type"] == "input_image":
-                        from mtplx.vision.media import image_bytes_from_url, validate_image_detail
+                        from mtplx.vision.media import (
+                            image_bytes_from_url,
+                            validate_image_detail,
+                        )
                         if item["role"] != "user":
                             raise ValueError("Images belong in user messages.")
                         validate_image_detail(part.get("detail", "auto"))
@@ -804,6 +1164,9 @@ class Session:
                     for i in self.items
                 ):
                     raise ValueError("Duplicate tool call id.")
+                if self.settings["background_tasks"]:
+                    task = self.task_ledger.register(item, self.input_revision)
+                    self.event("frankie.task.updated", task=task.public())
             elif item["type"] == "function_call_output":
                 if not any(
                     i.get("call_id") == item["call_id"] and i["type"] == "function_call"
@@ -816,10 +1179,29 @@ class Session:
                     for i in self.items
                 ):
                     raise ValueError("Tool result already supplied.")
+                if self.settings["background_tasks"]:
+                    if not isinstance(item.get("output"), str):
+                        raise ValueError("Tool output must be a string.")
+                    task, accepted = self.task_ledger.complete(item["call_id"])
+                    if accepted:
+                        self.input_revision += 1
+                        self.unhandled_task_results.add(item["call_id"])
+                    else:
+                        item["_task_discarded"] = True
+                    self.event(
+                        "frankie.task.updated", task=task.public(), result_discarded=not accepted
+                    )
             else:
                 raise ValueError("Unsupported conversation item type.")
             if item["type"] == "message" and item["role"] == "user":
+                if interrupt:
+                    if self.current.emitted_ms > 0:
+                        self.rollback_unheard(self.current)
+                    else:
+                        self.cancel()
+                        self.event("frankie.playback.clear", response_id=self.current.id)
                 self.attach_context(item, self.next_context())
+                self.accept_input()
             self.items.append(item)
             self.event(
                 "conversation.item.created", item=public(item), previous_item_id=None
@@ -827,12 +1209,50 @@ class Session:
             if any(p["type"] == "input_audio" for p in item.get("content", [])):
                 self.spawn(self.transcribe_item(item))
         elif kind == "response.create":
+            if self.speech_paused:
+                self.event("frankie.response.skipped", reason="user_requested_silence")
+                return
+            if self.settings["background_tasks"]:
+                # An explicit response request reserves available results even
+                # when an already captured user turn must be answered first.
+                if self.unhandled_task_results:
+                    self.queued_task_response = True
+                if self.unhandled_task_results and (
+                    self.listening or self.manual_size or self.semantic_pending
+                ):
+                    self.event("frankie.response.queued", reason="user_turn_pending")
+                    return
+                if self.semantic_pending:
+                    self.event("frankie.response.skipped", reason="semantic_turn_pending")
+                    return
+                if (self.unhandled_task_results and self.audible_response() is not None
+                        and (not self.user_revision or self.response_revision == self.user_revision)):
+                    self.event("frankie.response.queued", reason="playback_pending")
+                    self.maybe_start_task_response()
+                    return
+                if self.current and not self.current.done and not self.current.abort.is_set():
+                    if self.unhandled_task_results:
+                        self.event("frankie.response.queued", reason="background_task_result")
+                        return
+                    if self.response_revision == self.user_revision:
+                        self.event("frankie.response.skipped", reason="no_new_input")
+                        return
+                elif self.response_revision == self.user_revision and not self.unhandled_task_results:
+                    self.event("frankie.response.skipped", reason="no_new_input")
+                    return
             self.start()
         elif kind == "response.cancel":
             run = self.current
             if event.get("response_id") and (not run or event["response_id"] != run.id):
                 raise ValueError("Response id is not active.")
-            self.cancel()
+            self.queued_task_response = False
+            self.invalidate_semantics()
+            self.speech_paused = True
+            audible = self.audible_response()
+            if audible is not None:
+                self.rollback_unheard(audible)
+            else:
+                self.cancel()
         elif kind == "input_audio_buffer.append":
             await self.receive_audio(event["audio"], event.get("playback"))
         elif kind == "input_audio_buffer.commit":
@@ -843,6 +1263,7 @@ class Session:
             self.manual_size = 0
             self.capture_context = (0, "")
             self.items.append(item)
+            self.accept_input()
             self.event(
                 "input_audio_buffer.committed",
                 item_id=item["id"],
@@ -861,25 +1282,66 @@ class Session:
             self.capture_context = (0, "")
             self.reset_detectors()
             self.event("input_audio_buffer.cleared")
+            self.maybe_start_task_response()
+        elif kind == "frankie.task.cancel":
+            if not self.settings["background_tasks"]:
+                raise ValueError("Background tasks are not enabled.")
+            task, changed = self.task_ledger.cancel(event["call_id"], event.get("reason", "cancelled"))
+            if changed:
+                for item in self.items:
+                    if not task.consumed and item["type"] == "function_call_output" and item["call_id"] == task.call_id:
+                        item["_task_discarded"] = True
+                notice = task_notice(task.call_id, task.name, status=task.status)
+                notice["id"] = identifier("item")
+                # This is an explicit harness status update, not a completion
+                # claim. It preserves the point at which cancellation occurred.
+                notice["role"] = "system"
+                self.items.append(notice)
+                self.event("conversation.item.created", item=notice, previous_item_id=None)
+                self.unhandled_task_results.discard(task.call_id)
+                if not self.unhandled_task_results:
+                    self.queued_task_response = False
+            self.event(
+                "frankie.task.updated", task=task.public(),
+                cancellation_requested=changed and not task.received,
+            )
+        elif kind in {"frankie.playback.position", "frankie.playback.finished"}:
+            run = self.playback_runs.get(event["item_id"])
+            ms = event["audio_end_ms"]
+            if (
+                run is None or event.get("response_id") != run.id
+                or type(ms) is not int or not run.played_ms <= ms <= run.emitted_ms + 1
+            ):
+                raise ValueError("Invalid or stale playback position.")
+            if kind == "frankie.playback.finished":
+                if not run.done or ms < run.emitted_ms - 1:
+                    raise ValueError("Playback cannot finish before response completion and drain.")
+                run.playback_finished = True
+            run.played_ms = ms
+            self.settings["playback_feedback"] = True
+            if kind == "frankie.playback.finished":
+                self.maybe_start_task_response()
         elif kind == "conversation.item.truncate":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)
-            run = self.current
+            run = self.playback_runs.get(event["item_id"], self.current)
             if item is None and run and run.merged and run.item_id == event["item_id"]:
                 item = run.item
             if item is None or item.get("role") != "assistant":
                 raise ValueError("Unknown assistant audio item.")
             if run and run.item_id == item["id"]:
-                self.cancel()
                 ms = max(0, int(event["audio_end_ms"]))
-                run.played_ms = ms
-                text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= ms)
-                item["content"] = [
-                    {
-                        "type": "output_audio",
-                        "transcript": text + " [interrupted by the user]",
-                    }
-                ]
-                run.text = text
+                if not (run.playback_finished and ms >= run.emitted_ms - 1):
+                    run.abort.set()
+                    run.ready.set()
+                    run.played_ms = ms
+                    text = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= ms)
+                    item["content"] = [
+                        {
+                            "type": "output_audio",
+                            "transcript": text + " [interrupted by the user]",
+                        }
+                    ]
+                    run.text = text
             self.event(
                 "conversation.item.truncated",
                 item_id=item["id"],
@@ -907,6 +1369,11 @@ class Session:
 
     async def close(self):
         self.closed = True
+        if self.playback_wake is not None:
+            self.playback_wake.cancel()
+            self.playback_wake = None
+        if self.listener is not None:
+            self.listener.cancel()
         self.cancel()
         self.discard_spec()
         if self.turn is not None:

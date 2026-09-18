@@ -123,6 +123,9 @@ class Frankie:
                         if part["type"] == "input_image"
                         else marker
                     )
+                    if part["type"] == "input_audio" and part.get("_listener_transcript"):
+                        parts.append("Speech transcript (may contain errors): "
+                                     + part["_listener_transcript"])
             messages.append({"role": item["role"], "content": "\n".join(parts)})
         tools = [
             {
@@ -167,7 +170,7 @@ class Frankie:
         )
         return ids, splice
 
-    def warm(self, settings, *, session_id):
+    def warm(self, settings, *, session_id, bank=None):
         ids, _ = self.prompt(
             [
                 {
@@ -191,7 +194,7 @@ class Frankie:
             speculative_depth=max(1, self.mtp),
             mtp_history_policy="committed",
             verify_strategy="capture_commit",
-            session_bank=self.bank,
+            session_bank=self.bank if bank is None else bank,
             session_id=session_id,
             commit_prompt_state_to_bank=True,
         )
@@ -288,7 +291,7 @@ class Frankie:
             if not mouth_enabled or not speech_ids or in_thinking or in_tool:
                 return False
             current = self.tokenizer.decode(speech_ids).strip()
-            if value == "<tool_call>" or (
+            if value in {"<tool_call>", "<think>"} or (
                 value.startswith((" ", "\n"))
                 and (
                     re.search(r"[.!?]$", current)
@@ -309,6 +312,11 @@ class Frankie:
                 value = self.tokenizer.decode([token])
                 text_ids.append(token)
                 if value == "<think>":
+                    # A native reasoning opener ends the public phrase even
+                    # when there is no following whitespace token. Speech must
+                    # not wait until the private block finishes.
+                    if mouth_enabled and not in_thinking and not in_tool:
+                        chunk()
                     in_thinking = True
                     continue
                 if value == "</think>":

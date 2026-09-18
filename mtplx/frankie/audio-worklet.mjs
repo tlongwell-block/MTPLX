@@ -22,8 +22,10 @@ class DuplexAudio extends AudioWorkletProcessor {
     this.ended = false;
     this.starved = false;
     this.port.onmessage = ({ data }) => {
-      if (data.type === "done" && this.item?.itemId === data.itemId)
+      if (data.type === "done" && this.item?.itemId === data.itemId) {
         this.ended = true;
+        this.finishPlayback();
+      }
       if (data.type === "capture") this.capture = data.enabled;
       if (data.type === "backchannel") {
         if (this.queued || this.blocked.has(data.id)) return;
@@ -104,6 +106,14 @@ class DuplexAudio extends AudioWorkletProcessor {
         : null,
     });
   }
+  finishPlayback() {
+    // Generation may finish before or after the device renders its last sample.
+    // Keep an underrun interruptible, but never truncate a fully heard reply.
+    if (this.item && this.ended && this.queued === 0) {
+      this.position("finished");
+      this.item = null;
+    }
+  }
   process(inputs, outputs) {
     if (sampleRate !== 24000) {
       this.fail("device context must run at 24 kHz");
@@ -167,6 +177,7 @@ class DuplexAudio extends AudioWorkletProcessor {
         }
       }
     }
+    this.finishPlayback();
     this.rendered += output.length;
     this.tick += output.length;
     if (this.tick >= 2400) {

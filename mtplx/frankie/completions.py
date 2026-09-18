@@ -41,6 +41,9 @@ class Job:
         self.context = None
         self.prefill_step_size = 64
         self.cached_tokens = 0
+        self.internal = False
+        self.prepare_callback = None
+        self.bank = None
 
     def emit(self, value):
         try:
@@ -70,13 +73,21 @@ class Completions:
         self.active = {}
         self.batch = None
         self.driver = None
+        self.listener_bank = None
 
-    def submit(self, data, chat):
-        if len(self.jobs) >= self.slots:
+    def submit(self, data, chat, *, internal=False, prepare=None):
+        # A bounded listener request shares the model owner, but cannot be
+        # starved by client HTTP admission. It never duplicates model weights.
+        jobs = tuple(self.jobs)  # The inference owner can retire jobs concurrently.
+        if internal and any(j.internal for j in jobs):
+            raise OverflowError("A listener observation is already in flight.")
+        if not internal and sum(not j.internal for j in jobs) >= self.slots:
             raise OverflowError("All HTTP slots are busy.")
         job = Job(data, chat, self.loop)
+        job.internal = internal
+        job.prepare_callback = prepare
         self.jobs.add(job)
-        self.pending.append(job)
+        (self.pending.appendleft if internal else self.pending.append)(job)
         self.engine.background_step = self.voice_step
         if self.driver is None or self.driver.done():
             self.driver = asyncio.create_task(self.drive())
@@ -101,10 +112,51 @@ class Completions:
         self.step(voice=True)
         return True
 
+    def warm_listener(self):
+        """Warm the immutable instruction prefix on the inference owner.
+
+        Call through ``executor`` before enabling semantic overlap. Every
+        observation clones this exact state; it never becomes the voice cache
+        or gets replaced by a particular user's classifier input/output.
+        """
+        if self.listener_bank is None:
+            from mtplx.session_bank import SessionBank
+            self.listener_bank = SessionBank(
+                max_entries=1, max_bytes=512 * 1024**2,
+                per_session_max_bytes=512 * 1024**2,
+                # Static instructions live as long as these loaded weights.
+                # Expiry must not trigger a cold warmup during live overlap.
+                idle_ttl_s=float("inf"),
+            )
+        if self.engine.mtp and not len(self.listener_bank):
+            from .interaction import ListenerObservation, semantic_messages
+            instructions = semantic_messages(
+                ListenerObservation("warmup", 0, 0, ""), compact=True,
+            )[0]["content"]
+            self.engine.warm(
+                {"instructions": instructions, "thinking": "off", "tools": []},
+                session_id="listener-prefix", bank=self.listener_bank,
+            )
+            if not len(self.listener_bank):
+                raise RuntimeError("Listener instruction cache exceeded its memory budget.")
+        return {"cache_bytes": self.listener_bank.total_nbytes}
+
     def prepare(self, job):
         from mtplx.server.omlx_bridge.thinking import ThinkingParser
         from mtplx.server.omlx_bridge.tool_calling import ToolCallStreamFilter
 
+        if job.internal:
+            self.warm_listener()
+            job.bank = self.listener_bank
+        else:
+            job.bank = self.engine.bank
+        if job.prepare_callback is not None:
+            # Includes acoustic inference, if needed, on the same owner as
+            # brain/mouth inference and with voice feature capture suspended.
+            started = time.monotonic()
+            job.prepare_callback(job)
+            job.emit({"listener_prepare_seconds": time.monotonic() - started})
+            job.prepare_callback = None
         data = job.data
         if job.chat:
             items, instructions = [], []
@@ -211,10 +263,13 @@ class Completions:
             generate_mtpk, restore_or_prefill_prompt_state, _vision_rope_scope_for,
         )
         runtime = self.engine.runtime
+        bank = getattr(job, "bank", None)
+        if bank is None:
+            bank = self.engine.bank
         with _vision_rope_scope_for(job.splice):
             state = yield from restore_or_prefill_prompt_state.steps(
                 runtime, job.ids,
-                mtp_history_policy="committed", session_bank=self.engine.bank,
+                mtp_history_policy="committed", session_bank=bank,
                 restore_mode="clone", session_id=job.id,
                 store_prefix_snapshot=False,
                 abort_check=job.cancelled.is_set, vision_splice=job.splice,
@@ -231,8 +286,9 @@ class Completions:
                     self.emit_text(job, job.detokenizer.last_segment)
             result = yield from generate_mtpk.steps(
                 runtime, job.ids, _prompt_state=state,
-                session_bank=self.engine.bank, session_id=job.id,
-                session_restore_mode="clone", commit_prompt_state_to_bank=True,
+                session_bank=bank, session_id=job.id,
+                session_restore_mode="clone",
+                commit_prompt_state_to_bank=not getattr(job, "internal", False),
                 speculative_depth=self.engine.mtp, mtp_history_policy="committed",
                 verify_strategy="capture_commit", max_tokens=job.data["max_tokens"],
                 sampler=brain_sampler(job.data),
@@ -277,7 +333,10 @@ class Completions:
                     job.emit({"error": str(exc)})
             return
         if self.active:
-            uid = next(iter(self.active))
+            # Only one bounded internal probe is admitted. Prefer its short
+            # decoding slices, yielding back to speech between every slice.
+            uid = next((uid for uid, j in self.active.items() if getattr(j, "internal", False)),
+                       next(iter(self.active)))
             job = self.active.pop(uid)
             self.active[uid] = job
             try:
@@ -331,10 +390,11 @@ class Completions:
             job.emit(delta)
 
     def finish(self, job, reason):
-        from mtplx.server.omlx_bridge.tool_calling import parse_tool_calls
+        from .thinking import public_tool_calls
         job.detokenizer.finalize()
         self.emit_text(job, job.detokenizer.last_segment, final=True)
-        calls = parse_tool_calls(job.raw, self.engine.tokenizer, job.data.get("tools")).tool_calls if job.chat else None
+        calls = public_tool_calls(job.raw, self.engine.tokenizer, job.data.get("tools"),
+                                  starts_in_thinking=bool(job.data.get("enable_thinking"))) if job.chat else None
         if calls:
             job.emit({"tool_calls": [{"index": i, **call} for i, call in enumerate(calls)]})
             reason = "tool_calls"
@@ -437,6 +497,12 @@ def attach_routes(app, get_engine, executor, token, *, slots=4, context_tokens=4
     from fastapi.responses import JSONResponse, StreamingResponse
     service = None
 
+    def get_service():
+        nonlocal service
+        if service is None:
+            service = Completions(get_engine(), executor, slots, context_tokens)
+        return service
+
     async def complete(request: Request):
         nonlocal service
         if not hmac.compare_digest(request.headers.get("authorization", ""), "Bearer " + token):
@@ -503,9 +569,7 @@ def attach_routes(app, get_engine, executor, token, *, slots=4, context_tokens=4
                         validate_image_detail(image.get("detail", "auto"))
                         part["_bytes"] = await asyncio.to_thread(
                             image_bytes_from_url, image["url"], max_bytes=12 * 1024**2)
-            if service is None:
-                service = Completions(get_engine(), executor, slots, context_tokens)
-            job = service.submit(data, chat)
+            job = get_service().submit(data, chat)
         except OverflowError as exc:
             return JSONResponse({"error": {"message": str(exc), "type": "rate_limit_error"}}, status_code=429)
         except (ValueError, TypeError, KeyError, OSError) as exc:
@@ -568,3 +632,4 @@ def attach_routes(app, get_engine, executor, token, *, slots=4, context_tokens=4
 
     app.add_api_route("/v1/chat/completions", complete, methods=["POST"])
     app.add_api_route("/v1/completions", complete, methods=["POST"])
+    return get_service

@@ -49,8 +49,9 @@ def test_http_ar_penalties_only_count_generated_tokens():
 
     service = Completions.__new__(Completions)
     service.context_tokens = 64
-    service.engine = NS(mtp=0, tokenizer=NS(detokenizer=Detokenizer()))
-    job = NS(chat=False, splice=None, data={"prompt": [0, 1, 2], "max_tokens": 12,
+    service.engine = NS(mtp=0, bank=None, tokenizer=NS(detokenizer=Detokenizer()))
+    job = NS(chat=False, splice=None, internal=False, prepare_callback=None,
+        data={"prompt": [0, 1, 2], "max_tokens": 12,
         "thinking": "off", "enable_thinking": False, "presence_penalty": 1.5, "frequency_penalty": .5})
     service.prepare(job)
     logits = mx.zeros((1, 8))

@@ -129,6 +129,39 @@
       margin-top: 12px;
       color: #98a9ba;
     }
+    .presence {
+      display: grid;
+      justify-items: center;
+      gap: 22px;
+      padding: 30px 0;
+    }
+    #orb {
+      width: 190px;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      position: relative;
+      background: radial-gradient(circle at 35% 30%, #b9f8e1, #4b9f98 48%, #173e58 80%);
+      box-shadow: inset -12px -20px 35px #0b213a88, 0 0 45px #5dd3b422;
+      transform: scale(var(--voice-scale, 1));
+      transition: transform 90ms linear;
+    }
+    #orb::before {
+      content: "";
+      position: absolute;
+      inset: -16px;
+      border: 1px solid #8acbff88;
+      border-radius: 50%;
+      transform: scale(var(--input-scale, 1));
+      transition: transform 90ms linear;
+    }
+    #interaction { color: #a7c9db; min-height: 24px; }
+    #tasks:empty { display: none; }
+    .task { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+    .task span { flex: 1; }
+    .task button { padding: 3px 10px; font-size: 13px; }
+    @media (prefers-reduced-motion: reduce) {
+      #orb, #orb::before { transform: none; transition: none; }
+    }
   </style>
   <header>
     <div>
@@ -143,11 +176,19 @@
     >
   </header>
   <section class="panel">
+    <div class="presence">
+      <div id="orb" aria-hidden="true"></div>
+      <span id="interaction" role="status">Ready when you are</span>
+    </div>
     <div class="controls">
       <button class="primary" id="start">Start conversation</button
       ><button id="stop" disabled>End</button
       ><button id="interrupt" disabled>Interrupt</button
       ><span id="status">Ready to connect</span>
+      <label>Mode <select id="mode">
+        <option value="baseline">Baseline</option>
+        <option value="v4" selected>v4 experimental</option>
+      </select></label>
     </div>
     <div id="meter"><div id="level"></div></div>
     <details>
@@ -166,6 +207,8 @@
           ><input type="checkbox" id="speak" checked />Speak responses</label
         >
       </div>
+      <label><input type="checkbox" id="demoTool" />Enable fictional demo lookup</label>
+      <p class="muted">Optional: ask for the demo weather or travel time. The lookup takes six seconds and uses sample data only.</p>
       <label
         >Voice reference
         <input id="voice" type="file" accept="audio/wav" /></label
@@ -180,6 +223,8 @@
       </p>
     </details>
     <div id="stats"></div>
+    <small id="features"></small>
+    <div id="tasks" aria-live="polite"></div>
   </section>
   <section class="panel"><div id="log" aria-live="polite"></div></section>
   <section class="panel">
@@ -206,6 +251,18 @@
     const messages = new Map(),
       evidence = [];
     let lastPlayback = null;
+    let playbackFeedback = false,
+      lastFeedback = -Infinity;
+    const taskRows = new Map();
+    const demoCalls = new Map();
+    const demoTool = {
+      type: "function", name: "demo_lookup",
+      description: "A fictional demonstration lookup taking six seconds. Returns sample weather or travel time; never live information.",
+      parameters: {
+        type: "object", properties: { topic: { type: "string", enum: ["weather", "travel"] } },
+        required: ["topic"], additionalProperties: false,
+      },
+    };
     window.frankieTest = { evidence, send: (event) => send(event) };
     function record(type, data = {}) {
       evidence.push({ time: performance.now(), type, ...data });
@@ -255,11 +312,100 @@
               thinking
             ],
           output_modalities: [$("speak").checked ? "audio" : "text"],
+          tools: $("demoTool").checked ? [demoTool] : [],
+          ...($("demoTool").checked ? {
+            instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information. Briefly acknowledge a lookup, then call the tool. Keep chatting naturally while it runs.",
+          } : {}),
+          ...($("mode").value === "v4" ? {
+            frankie: {
+              interruption_policy: "semantic",
+              playback_feedback: true,
+              background_tasks: true,
+            },
+          } : {}),
         },
       });
     }
     function clearPlayback() {
       node?.port.postMessage({ type: "clear", requestId: "interrupt" });
+    }
+    function interaction(state, reason) {
+      const labels = {
+        listen: "Listening", continue: "Listening while speaking",
+        adapt: "Adjusting the reply", yield: "Your turn", stop: "Waiting for you", task: "Working in the background",
+      };
+      if (!labels[state]) return;
+      $("interaction").textContent = labels[state];
+      $("interaction").title = reason || "";
+      record("interaction", { state, reason });
+    }
+    function feedback(type, playback) {
+      if (!playbackFeedback || !playback) return;
+      const now = performance.now();
+      if (type === "position" && now - lastFeedback < 250) return;
+      lastFeedback = now;
+      send({
+        type: "frankie.playback." + type,
+        item_id: playback.itemId,
+        response_id: playback.responseId,
+        audio_end_ms: Math.floor(playback.playedSamples / 24),
+      });
+    }
+    function updateTask(task, cancellationRequested = false) {
+      if (cancellationRequested || task.status === "cancelled" || task.status === "superseded") stopDemoCall(task.call_id);
+      let entry = taskRows.get(task.call_id);
+      if (!entry) {
+        const row = document.createElement("div");
+        row.className = "task";
+        const label = document.createElement("span"), cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.onclick = () => {
+          cancel.disabled = true;
+          stopDemoCall(task.call_id);
+          send({ type: "frankie.task.cancel", call_id: task.call_id });
+        };
+        row.append(label, cancel);
+        $("tasks").append(row);
+        entry = { row, label, cancel };
+        taskRows.set(task.call_id, entry);
+      }
+      entry.label.textContent = `${task.name || "Task"} · ${cancellationRequested ? "cancellation requested" : task.status}`;
+      entry.cancel.disabled = task.status !== "running" || cancellationRequested;
+    }
+    function stopDemoCall(id) {
+      const call = demoCalls.get(id);
+      if (!call) {
+        // Cancellation may arrive before the final function arguments.
+        demoCalls.set(id, { cancelled: true });
+        return;
+      }
+      clearTimeout(call.timer);
+      call.cancelled = true;
+    }
+    function runDemoCall(call) {
+      if (!$("demoTool").checked || call.name !== "demo_lookup" || !call.call_id || demoCalls.has(call.call_id)) return;
+      const pending = { cancelled: false }, socket = ws;
+      demoCalls.set(call.call_id, pending);
+      pending.timer = setTimeout(() => {
+        if (pending.cancelled || ws !== socket || socket.readyState !== 1) return;
+        let result;
+        try {
+          const { topic } = JSON.parse(call.arguments);
+          result = topic === "weather"
+            ? { fictional: true, weather: "clear skies", temperature_celsius: 20 }
+            : topic === "travel"
+              ? { fictional: true, travel_minutes: 42 }
+              : { error: "Choose the weather or travel demo topic." };
+        } catch {
+          result = { error: "Demo lookup arguments must be valid JSON." };
+        }
+        send({
+          type: "conversation.item.create",
+          item: { type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result) },
+        });
+        send({ type: "response.create" });
+        record("demo_tool_result", { call_id: call.call_id });
+      }, 6000);
     }
     async function onEvent(e) {
       record(e.type, { response_id: e.response_id, item_id: e.item_id });
@@ -268,10 +414,37 @@
         return;
       }
       if (e.type === "session.updated") {
+        playbackFeedback = e.session?.frankie?.playback_feedback === true;
+        const features = e.session?.frankie || {};
+        $("features").textContent = $("mode").value === "baseline"
+          ? "Baseline turn handling"
+          : [
+            features.interruption_policy === "semantic" ? "Semantic turn handling"
+              : features.interruption_policy === "observe" ? "Listener observation only" : "Semantic listener unavailable",
+            features.background_tasks ? "Background tasks enabled" : "Background tasks unavailable",
+          ].join(" · ");
         ready = true;
         node?.port.postMessage({ type: "capture", enabled: true });
         status("Listening");
         $("send").disabled = false;
+        interaction("listen");
+        return;
+      }
+      if (e.type === "input_audio_buffer.speech_started") {
+        // Audio activity is not necessarily an interruption. The MTPLX server
+        // owns that decision and sends frankie.playback.clear when appropriate.
+        return;
+      }
+      if (e.type === "frankie.interaction") {
+        interaction(e.state, e.reason);
+        return;
+      }
+      if (e.type === "frankie.task.updated") {
+        updateTask(e.task, e.cancellation_requested);
+        return;
+      }
+      if (e.type === "response.function_call_arguments.done") {
+        runDemoCall(e);
         return;
       }
       if (e.type === "response.created") {
@@ -282,7 +455,7 @@
       }
       if (e.type === "conversation.item.created") {
         const i = e.item;
-        if (i.type === "message") {
+        if (i.type === "message" && ["user", "assistant"].includes(i.role)) {
           const text = i.content
             .map(
               (p) =>
@@ -297,7 +470,7 @@
             .join("\n");
           message(i.id, i.role, text);
         }
-        if (pendingText && i.role === "user") {
+        if (pendingText && i.type === "message" && i.role === "user") {
           pendingText = false;
           send({ type: "response.create" });
         }
@@ -313,10 +486,11 @@
           messages.get(e.item_id)?.textContent || "",
         );
         row.textContent += e.delta;
+        $("log").scrollTop = $("log").scrollHeight;
         return;
       }
       if (e.type === "response.output_audio.done") {
-        node.port.postMessage({ type: "done", itemId: e.item_id });
+        node?.port.postMessage({ type: "done", itemId: e.item_id });
         return;
       }
       if (e.type === "response.output_audio.delta") {
@@ -334,10 +508,12 @@
         return;
       }
       if (e.type === "response.done") {
+        if (e.response.id !== current) return;
         active = false;
         status(
           e.response.status === "failed" ? "Response failed" : "Listening",
         );
+        record("response_status", { responseId: e.response.id, status: e.response.status });
         if (e.response.status === "failed")
           message(
             "error_" + Date.now(),
@@ -367,11 +543,13 @@
         return;
       }
       $("start").disabled = true;
+      $("mode").disabled = true;
+      $("demoTool").disabled = true;
       status("Connecting…");
       try {
         ctx = new AudioContext({ sampleRate: 24000 });
         await ctx.resume();
-        await ctx.audioWorklet.addModule("/audio-worklet.mjs");
+        await ctx.audioWorklet.addModule("/audio-worklet.mjs?v=completed-playback");
         node = new AudioWorkletNode(ctx, "duplex-audio", {
           numberOfInputs: 1,
           numberOfOutputs: 1,
@@ -393,10 +571,19 @@
             let peak = 0;
             for (const x of data.pcm) peak = Math.max(peak, Math.abs(x));
             $("level").style.width = Math.min(100, peak / 100) + "%";
+            let outputPeak = 0;
+            for (const x of data.playback) outputPeak = Math.max(outputPeak, Math.abs(x));
+            $("orb").style.setProperty("--input-scale", 1 + Math.min(0.25, peak / 32768));
+            $("orb").style.setProperty("--voice-scale", 1 + Math.min(0.18, outputPeak / 32768));
             record("capture", { samples: data.pcm.length });
           } else if (data.type === "position") {
             lastPlayback = data.playback;
             record("playback", { ...data.playback });
+            feedback("position", data.playback);
+          } else if (data.type === "finished") {
+            lastPlayback = null;
+            record("playback_finished", data.playback);
+            feedback("finished", data.playback);
           } else if (data.type === "stopped" && data.playback) {
             const p = data.playback;
             send({
@@ -453,6 +640,17 @@
       active = false;
       pendingText = false;
       current = null;
+      playbackFeedback = false;
+      lastFeedback = -Infinity;
+      lastPlayback = null;
+      taskRows.clear();
+      for (const call of demoCalls.values()) clearTimeout(call.timer);
+      demoCalls.clear();
+      $("tasks").replaceChildren();
+      $("features").textContent = "";
+      $("interaction").textContent = "Ready when you are";
+      $("orb").style.setProperty("--input-scale", 1);
+      $("orb").style.setProperty("--voice-scale", 1);
       tracks?.getTracks().forEach((t) => t.stop());
       tracks = null;
       node?.port.postMessage({ type: "capture", enabled: false });
@@ -465,12 +663,18 @@
       ctx = null;
       await audioContext?.close().catch(() => {});
       $("start").disabled = false;
+      $("mode").disabled = false;
+      $("demoTool").disabled = $("mode").value !== "v4";
       $("stop").disabled = true;
       $("interrupt").disabled = true;
       $("send").disabled = true;
       record("ended");
     }
     $("start").onclick = start;
+    $("mode").onchange = () => {
+      $("demoTool").disabled = $("mode").value !== "v4";
+      if ($("demoTool").disabled) $("demoTool").checked = false;
+    };
     $("stop").onclick = end;
     $("interrupt").onclick = () => {
       send({ type: "response.cancel", response_id: current });

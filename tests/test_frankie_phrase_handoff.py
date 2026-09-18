@@ -17,6 +17,7 @@ mx = pytest.importorskip("mlx.core")
         ("Hi,", " there.", False),
         ("The value is 3.", "14", False),
         ("Let me check.", "<tool_call>", True),
+        ("Let me check.", "<think>", True),
         ("word " * 15 + "word", " next.", True),
     ],
 )
