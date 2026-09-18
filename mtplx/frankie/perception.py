@@ -55,9 +55,9 @@ class RealtimeListener:
                 "presence_penalty": 0, "frequency_penalty": 0,
                 "thinking": "off", "enable_thinking": False, "tools": []}
 
-    async def _run(self, data, prepare, *, prepare_only=False):
+    async def _run(self, data, prepare, *, prepare_only=False, urgent=False):
         started = time.monotonic()
-        job = (self.service.submit_prepare(prepare) if prepare_only else
+        job = (self.service.submit_prepare(prepare, **({"urgent": True} if urgent else {})) if prepare_only else
                self.service.submit(data, True, internal=True, prepare=prepare))
         self.job = job
         stats = {}
@@ -201,3 +201,47 @@ class RealtimeListener:
         event, _ = await self._run({}, lambda job: self._hear_prefix(snapshot, job, compare=False),
                                    prepare_only=True)
         return event["prepared"]
+
+    async def hear_prefix(self, snapshot):
+        """Paired disposable CTC snapshots on the same owner; no brain inference."""
+        await self._admit()
+        generation = self._generation
+        event, stats = await self._run(
+            {}, lambda job: self._hear_prefix(snapshot, job, compare=True), prepare_only=True, urgent=True)
+        if self.session.closed or generation != self._generation:
+            raise RuntimeError("Backchannel observation was cancelled.")
+        return event["prepared"], stats
+
+    async def classify_backchannel(self, item, run, *, fragments=None):
+        """Finish a short overlap without a language-model floor probe."""
+        from .backchannel import decide_backchannel as classify
+        await self._admit()
+        generation = self._generation
+        items = fragments or (item,)
+
+        def prepare(job):
+            texts = []
+            for fragment in items:
+                for part in fragment["content"]:
+                    if part["type"] != "input_audio":
+                        continue
+                    if job.cancelled.is_set():
+                        raise RuntimeError("Backchannel observation was cancelled.")
+                    if "_rows" not in part or "_transcript" not in part:
+                        part["_rows"], part["_transcript"] = self.session.engine.audio.hear(
+                            part["_pcm"], part.get("_rate", 24000))
+                    texts.append(part["_transcript"].strip())
+            return " ".join(text for text in texts if text)
+
+        event, stats = await self._run({}, prepare, prepare_only=True)
+        if self.session.closed or generation != self._generation:
+            raise RuntimeError("Backchannel observation was cancelled.")
+        text = event["prepared"]
+        decision = classify(text, voiced_ms=sum(i.get("_speech_voiced_ms", 0) for i in items),
+                            elapsed_ms=sum(i.get("_speech_elapsed_ms", 0) for i in items), final=True)
+        action = {"preserve": "continue", "wait": "wait", "yield": "yield"}[decision.action]
+        observation = ListenerObservation(item["id"], self.revision, self.session.clock_ms,
+                                          text, assistant_speaking=True, user_speaking=False,
+                                          is_final=True)
+        return ListeningDecision(action), observation, {
+            **stats, "policy": "brief_backchannel", "reason": decision.reason}

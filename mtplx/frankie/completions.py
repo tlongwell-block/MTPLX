@@ -52,6 +52,7 @@ class Job:
         self.internal = False
         self.prepare_callback = None
         self.prepare_only = False
+        self.urgent_prepare = False
         self.prepare_seconds = 0.0
         self.bank = None
         self.owner_work_ms = 0.0
@@ -91,9 +92,11 @@ class Completions:
         self.detokenizer_template = None
         self.listener_detokenizer_primed = False
 
-    def submit(self, data, chat, *, internal=False, prepare=None, prepare_only=False):
+    def submit(self, data, chat, *, internal=False, prepare=None, prepare_only=False, urgent=False):
         if prepare_only and (not internal or not callable(prepare)):
             raise ValueError("Prepare-only work requires an internal owner callback.")
+        if type(urgent) is not bool or (urgent and not prepare_only):
+            raise ValueError("Urgent work must be an explicit prepare-only operation.")
         # A bounded listener request shares the model owner, but cannot be
         # starved by client HTTP admission. It never duplicates model weights.
         jobs = tuple(self.jobs)  # The inference owner can retire jobs concurrently.
@@ -105,16 +108,21 @@ class Completions:
         job.internal = internal
         job.prepare_callback = prepare
         job.prepare_only = prepare_only
+        job.urgent_prepare = urgent
         self.jobs.add(job)
         (self.pending.appendleft if internal else self.pending.append)(job)
         self.engine.background_step = self.voice_step
+        if urgent:
+            self.engine.urgent_background_step = self.urgent_step
         if self.driver is None or self.driver.done():
             self.driver = asyncio.create_task(self.drive())
         return job
 
-    def submit_prepare(self, callback):
+    def submit_prepare(self, callback, *, urgent=False):
         """One bounded internal owner operation, with no brain warmup/prefill."""
-        return self.submit({}, True, internal=True, prepare=callback, prepare_only=True)
+        # Only short disposable prefix CTC opts into the lower playback reserve.
+        return self.submit({}, True, internal=True, prepare=callback, prepare_only=True,
+                           urgent=urgent)
 
     @staticmethod
     def owner_work(job, callback, *args):
@@ -212,6 +220,14 @@ class Completions:
                 # check and this call. Never advance HTTP in an extra slice.
                 self.step(voice=True, internal_only=True)
         return True
+
+    def urgent_step(self, lead):
+        """Run only opted-in short ear work while retaining 120ms of playback."""
+        # Keep this cheap callback registered after first use. Clearing it from
+        # the owner can race a new admission on the event-loop thread.
+        if not lead >= 0.12:  # Also reject NaN without touching the owner.
+            return False
+        return self.step(voice=True, prepare_only=True)
 
     def warm_listener(self):
         """Warm the immutable instruction prefix on the inference owner.
@@ -554,7 +570,15 @@ class Completions:
                       **self.owner_usage(job)}})
         self.jobs.discard(job)
 
-    def step(self, *, voice=False, internal_only=False):
+    def step(self, *, voice=False, internal_only=False, prepare_only=False):
+        # Recheck here, on the actual owner: admission can change between the
+        # engine's cheap urgent callback and dispatch. Never fall through to
+        # HTTP, Qwen, or an unmarked full-turn ear operation at low reserve.
+        if prepare_only and (not self.pending
+                or not getattr(self.pending[0], "internal", False)
+                or not getattr(self.pending[0], "prepare_only", False)
+                or not getattr(self.pending[0], "urgent_prepare", False)):
+            return False
         import mlx.core as mx
         model = getattr(self.engine.runtime.model, "language_model", self.engine.runtime.model)
         features = getattr(model, "_mtplx_feature_stream", None)
@@ -567,7 +591,7 @@ class Completions:
                         self.batch.close()
                         self.batch = None
                     self.engine.background_step = None
-                return
+                return True
             if self.engine.mtp:
                 self.step_mtp(voice, internal_only=internal_only)
                 if not self.jobs:

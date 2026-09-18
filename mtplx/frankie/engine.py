@@ -258,6 +258,11 @@ class Frankie:
                     if audio_start is not None
                     else 0
                 )
+                urgent = getattr(self, "urgent_background_step", None)
+                if urgent is not None and urgent(lead):
+                    # Only bounded prefix CTC can run here. Recompute reserve
+                    # and cancellation before mouth or ordinary background work.
+                    continue
                 background = getattr(self, "background_step", None)
                 target_lead = 0.8 if background is not None else 0.4
                 if lead >= target_lead:

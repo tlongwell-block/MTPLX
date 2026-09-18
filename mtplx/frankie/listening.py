@@ -24,8 +24,8 @@ from .interaction import ACTIONS, MAX_OBSERVATION_SECONDS
 
 
 def _words(text: str) -> tuple[str, ...]:
-    # Compare all recognized words, never a longest common prefix. Keep the
-    # original complete text for semantics, including punctuation and qualifiers.
+    # Normalize complete observations; retain original text for policy decisions,
+    # including punctuation and qualifiers.
     text = unicodedata.normalize("NFKC", text).casefold().replace("’", "'")
     return tuple(re.findall(r"\b[\w']+\b", text))
 
@@ -81,6 +81,20 @@ class PrefixEvidence:
             self.previous_text is not None
             and bool(_words(self.text))
             and _words(self.text) == _words(self.previous_text)
+            and (self.snapshot.samples - self.previous_samples) * 1000
+            >= separation_ms * self.snapshot.sample_rate
+        )
+
+    def stable_prefix(self, separation_ms: int) -> bool:
+        """Earlier whole words survived; this does not certify semantic intent.
+
+        Fast nod filtering must additionally classify both full observations.
+        Semantic decisions continue to use strict ``stable`` equality.
+        """
+        previous = _words(self.previous_text) if self.previous_text is not None else ()
+        return (
+            bool(previous)
+            and _words(self.text)[:len(previous)] == previous
             and (self.snapshot.samples - self.previous_samples) * 1000
             >= separation_ms * self.snapshot.sample_rate
         )
@@ -375,5 +389,40 @@ class StreamingListener:
                                  ticket.revision, latest.snapshot.samples, selected.action,
                                  selected.intent, reason if not eligible or apply else "observation_only",
                                  eligible, apply)
+        self.retire(ticket)
+        return result
+
+    def complete_backchannel(self, ticket: ListeningSnapshot, evidence: PrefixEvidence,
+                             action: str) -> ListeningResult:
+        """Gate an ear-only acknowledgment heuristic, not a semantic assertion.
+
+        Other recognized content takes the floor without waiting for stability
+        or a second classification. Identity and bounded age still apply. This
+        path spends no brain-probe budget and retains the bounded PCM cadence.
+        """
+        if action not in {"continue", "wait", "yield"}:
+            raise ValueError("Invalid backchannel action.")
+        age_ms = (self.clock() - ticket.captured_at) * 1000
+        reason = "eligible"
+        if ticket is not self._inflight or not self._active or ticket.epoch != self._epoch:
+            reason = "stale_ticket"
+        elif evidence.snapshot is not ticket:
+            reason = "wrong_evidence"
+        elif self.exhausted:
+            reason = "audio_budget"
+        elif not math.isfinite(age_ms) or not 0 <= age_ms <= self.max_causal_lag_ms:
+            reason = "expired"
+        elif (self._samples - ticket.samples) * 1000 > self.max_causal_lag_ms * self.sample_rate:
+            reason = "causal_audio_lag"
+        if reason == "eligible" and not ticket.final:
+            self._partial_probes -= 1
+        eligible = reason == "eligible"
+        apply = eligible and action == "yield" and self.allow_control
+        if apply:
+            self._applied = True
+        intent = {"continue": "backchannel", "wait": "wait", "yield": "take_floor"}[action]
+        result = ListeningResult(ticket.response_id, ticket.utterance_id, ticket.epoch,
+                                 ticket.revision, ticket.samples, action, intent,
+                                 reason if not eligible else intent, eligible, apply)
         self.retire(ticket)
         return result

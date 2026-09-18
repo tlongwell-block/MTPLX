@@ -88,6 +88,8 @@ class Session:
         self.prefix_listener = StreamingListener()
         self.prefix_task = None
         self.prefix_yielded = False
+        self.backchannel_text = ""
+        self.speech_voiced_ms = 0
         self.overlap_run = None
         self.overlap_prefix_ms = 0
         self.semantic_pending = 0
@@ -445,6 +447,10 @@ class Session:
 
                 traceback.print_exc()
                 error = str(exc)
+        # Tool-only replies and immediate EOS can finish without emit's gate.
+        # Retain their result until commitment, leaving the inference owner free.
+        while not run.ready.is_set() and not run.abort.is_set() and not self.closed:
+            await asyncio.sleep(0.01)
         run.done = True
         if self.closed:
             return
@@ -610,6 +616,20 @@ class Session:
         if not observer.active:
             return
         observer.append(np.clip(frame * 32767, -32768, 32767).astype("<i2").tobytes())
+        fast = self.settings["streaming_listener"] == "backchannel"
+        # VAP may hold a completed nod through silence. Silence alone must not
+        # turn that nod into sustained speech or trigger a deadline clear.
+        elapsed_ms = max(0, self.last_speech_ms - self.speech_start_ms + 32)
+        if fast:
+            from .backchannel import decide_backchannel as classify
+            deadline = classify(self.backchannel_text, voiced_ms=self.speech_voiced_ms,
+                                elapsed_ms=elapsed_ms)
+            if deadline.action == "yield" and self.yield_prefix(self.overlap_run, deadline.reason):
+                self.event("frankie.interaction.prefix", utterance_id=self.speech_id,
+                           response_id=observer.response_id, action="yield", gate=deadline.reason,
+                           transcript=self.backchannel_text, policy="brief_backchannel",
+                           observed_audio_ms=elapsed_ms, apply=True, confidence=None)
+                return
         if self.clock_ms - self.speech_start_ms + 32 < 320:
             return  # Retained context/pre-roll is not newly observed speech.
         ticket = observer.request()
@@ -617,8 +637,10 @@ class Session:
             run = self.overlap_run
             heard = " ".join(c["text"] for c in run.chunks if c["end_ms"] <= run.played_ms)
             pending = any(t.status == "running" for t in self.task_ledger.tasks.values())
-            self.prefix_task = self.spawn(self.observe_prefix(
-                ticket, run, heard, pending, self.settings["assistant_name"]))
+            self.prefix_task = self.spawn(
+                self.observe_backchannel(ticket, run, self.speech_voiced_ms, elapsed_ms)
+                if fast else self.observe_prefix(
+                    ticket, run, heard, pending, self.settings["assistant_name"]))
             def retired(task):
                 # Cancellation before the coroutine first runs skips its
                 # finally block; no owner job exists in that case.
@@ -626,6 +648,62 @@ class Session:
                 if self.prefix_task is task:
                     self.prefix_task = None
             self.prefix_task.add_done_callback(retired)
+
+    def yield_prefix(self, run, reason):
+        """Discard old speech immediately; complete PCM still owns the next turn."""
+        td = self.settings["turn_detection"]
+        if (run is None or self.current is not run or run.abort.is_set()
+                or run.playback_finished or not self.listening or td is None
+                or not td.get("interrupt_response", True)):
+            return False
+        self.rollback_unheard(run)
+        self.overlap_run = None
+        self.overlap_prefix_ms = 0
+        self.prefix_yielded = True
+        self.cancel_prefix()
+        if self.listener is not None:
+            self.listener.cancel()
+        self.event("frankie.interaction", state="yield", reason=reason)
+        return True
+
+    async def observe_backchannel(self, ticket, run, voiced_ms, elapsed_ms):
+        from .backchannel import decide_backchannel as classify
+        observer = self.prefix_listener
+        started = time.monotonic()
+        try:
+            evidence, stats = await self.listener.hear_prefix(ticket)
+            decision = classify(evidence.text, voiced_ms=voiced_ms, elapsed_ms=elapsed_ms)
+            action = {"preserve": "continue", "wait": "wait", "yield": "yield"}[decision.action]
+            # Growing speech need not repeat its entire transcript, but the
+            # earlier whole prefix must already be more than a verbal nod.
+            # Always decide from both complete texts, never a cropped prefix.
+            unstable = action == "yield" and not (
+                evidence.stable_prefix(observer.stability_ms)
+                and classify(evidence.previous_text, voiced_ms=0, elapsed_ms=0).action == "yield")
+            if unstable:
+                action = "wait"
+            result = observer.complete_backchannel(ticket, evidence, action)
+            if result.eligible and self.current is run and self.speech_id == ticket.utterance_id:
+                # An early bad CTC guess must not become an immediate clear on
+                # the next frame. Sustained unrecognized speech still has its
+                # explicit short deadline; a confirmed nod can replace this.
+                self.backchannel_text = "" if unstable else evidence.text
+            apply = result.apply and self.yield_prefix(run, decision.reason)
+            self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
+                       response_id=run.id, action=action, gate=result.reason,
+                       reason="unstable_words" if unstable else decision.reason,
+                       transcript=evidence.text, previous_transcript=evidence.previous_text,
+                       observed_audio_ms=elapsed_ms, policy="brief_backchannel",
+                       apply_lag_ms=round((time.monotonic() - ticket.captured_at) * 1000, 3),
+                       metrics={**stats, "total_ms": (time.monotonic() - started) * 1000},
+                       apply=bool(apply), confidence=None)
+        except (ValueError, RuntimeError, TimeoutError, OverflowError) as exc:
+            self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
+                       response_id=run.id, action="wait", gate="unavailable", reason=str(exc), apply=False)
+        finally:
+            observer.retire(ticket)
+            if self.prefix_task is asyncio.current_task():
+                self.prefix_task = None
 
     async def observe_prefix(self, ticket, run, heard, pending, name):
         """A disposable prefix can yield the floor, never finish the user's turn."""
@@ -673,15 +751,7 @@ class Session:
                        metrics={**stats, "total_ms": (time.monotonic() - started) * 1000},
                        apply=apply, confidence=None)
             if apply:
-                self.rollback_unheard(run)
-                # Keep the complete captured PCM. Ordinary endpointing and a
-                # fresh generation handle what the user ultimately says.
-                self.overlap_run = None
-                self.overlap_prefix_ms = 0
-                self.prefix_yielded = True
-                self.cancel_prefix()
-                self.event("frankie.interaction", state="yield",
-                           reason="User took the floor; listening for the complete turn.")
+                self.yield_prefix(run, "User took the floor; listening for the complete turn.")
         except (ValueError, RuntimeError, TimeoutError, OverflowError) as exc:
             self.event("frankie.interaction.prefix", utterance_id=ticket.utterance_id,
                        response_id=run.id, action="wait", gate="unavailable",
@@ -765,6 +835,8 @@ class Session:
         if speech_end_ms is not None:
             item["_speech_start_ms"] = self.speech_start_ms
             item["_speech_end_ms"] = speech_end_ms
+            item["_speech_voiced_ms"] = self.speech_voiced_ms
+            item["_speech_elapsed_ms"] = max(0, speech_end_ms - self.speech_start_ms + 32)
         return item
 
     def next_context(self):
@@ -881,7 +953,9 @@ class Session:
                     and epoch == self.semantic_epoch and revision == self.user_revision)
 
         async def replace_response():
-            if not current() or run.abort.is_set():
+            td = self.settings["turn_detection"]
+            if (not current() or run.abort.is_set() or td is None
+                    or not td.get("interrupt_response", True)):
                 return
             self.rollback_unheard(run)
             while not run.done and current():
@@ -892,14 +966,18 @@ class Session:
                 self.start(deferred_task_results=deferred)
 
         try:
-            decision, observation, stats = await self.listener.classify(item, run, fragments=fragments)
+            fast = self.settings["streaming_listener"] == "backchannel"
+            classify = self.listener.classify_backchannel if fast else self.listener.classify
+            decision, observation, stats = await classify(item, run, fragments=fragments)
             for fragment in fragments:
                 for index, part in enumerate(fragment["content"]):
                     if part["type"] == "input_audio":
                         self.transcribed(fragment, index, part.get("_transcript", ""))
-            action = decision.action if observation.user_text.strip() else "wait"
+            action = decision.action if fast or observation.user_text.strip() else "wait"
             apply = (self.settings["interruption_policy"] == "semantic"
-                     and current() and not run.abort.is_set())
+                     and current() and not run.abort.is_set()
+                     and self.settings["turn_detection"] is not None
+                     and self.settings["turn_detection"].get("interrupt_response", True))
             self.event("frankie.interaction.observed", utterance_id=item["id"],
                        utterance_ids=[fragment["id"] for fragment in fragments],
                        action=action, confidence=None, evidence="final_ctc_text",
@@ -910,7 +988,8 @@ class Session:
                 for fragment in fragments:
                     fragment["_listener_consumed"] = True
             self.event("frankie.interaction", state=action,
-                       reason="Experimental semantic decision on completed speech.")
+                       reason=("Brief acknowledgment check on completed speech." if fast else
+                               "Experimental semantic decision on completed speech."))
             if action == "stop":
                 self.rollback_unheard(run)
                 self.speech_paused = True
@@ -996,6 +1075,8 @@ class Session:
                     self.overlap_run, self.clock_ms)) if self.overlap_run is not None else 0
                 self.listening = True
                 self.prefix_yielded = False
+                self.backchannel_text = ""
+                self.speech_voiced_ms = 0
                 self.capture_context = self.next_context()
                 self.speech_start_ms = self.clock_ms
                 self.frames = list(self.pre)
@@ -1026,6 +1107,9 @@ class Session:
                 )
             if self.listening:
                 self.frames.append(frame)
+                if voiced:
+                    self.speech_voiced_ms += 32
+                    self.last_speech_ms = self.clock_ms
                 self.append_prefix(frame)
                 buffered_samples = sum(len(x) for x in self.frames)
                 if (self.overlap_run is not None
@@ -1089,7 +1173,8 @@ class Session:
                     if (
                         self.silence >= 96
                         and self.spec is None
-                        and not self.prefix_yielded
+                        and (not self.prefix_yielded
+                             or self.settings["streaming_listener"] == "backchannel")
                         and can_start
                         and td.get("create_response", True)
                     ):
@@ -1196,9 +1281,10 @@ class Session:
                 new["playback_pause"] = extensions["playback_pause"]
             if "streaming_listener" in extensions:
                 mode = extensions["streaming_listener"]
-                if mode not in {"off", "observe", "semantic"}:
-                    raise ValueError("Use off, observe, or semantic streaming_listener.")
-                if mode != "off" and not hasattr(self.listener, "classify_prefix"):
+                if mode not in {"off", "observe", "semantic", "backchannel"}:
+                    raise ValueError("Use off, observe, semantic, or backchannel streaming_listener.")
+                method = "hear_prefix" if mode == "backchannel" else "classify_prefix"
+                if mode != "off" and not hasattr(self.listener, method):
                     raise ValueError("Streaming listener is unavailable in this server.")
                 new["streaming_listener"] = mode
             if "assistant_name" in extensions:
@@ -1267,7 +1353,8 @@ class Session:
             if self.listening or self.manual_size:
                 raise ValueError("Clear pending audio before changing settings.")
             if (new["interruption_policy"] != "vad"
-                    and self.settings["interruption_policy"] == "vad"):
+                    and self.settings["interruption_policy"] == "vad"
+                    and new["streaming_listener"] != "backchannel"):
                 await self.loop.run_in_executor(
                     self.executor, self.listener.service.warm_listener
                 )
@@ -1288,7 +1375,8 @@ class Session:
                         ledger.complete(item["call_id"])
                 self.task_ledger = ledger
             self.settings = new
-            self.prefix_listener.allow_control = new["streaming_listener"] == "semantic"
+            self.prefix_listener.allow_control = new["streaming_listener"] in {"semantic", "backchannel"}
+            self.prefix_listener.interval_ms = 160 if new["streaming_listener"] == "backchannel" else 320
             if (new["interruption_policy"] != "semantic"
                     or not new["playback_pause"] or not new["playback_feedback"]
                     or new["turn_detection"] is None

@@ -346,7 +346,7 @@
               interruption_policy: "semantic",
               playback_feedback: true,
               playback_pause: false,
-              streaming_listener: "semantic",
+              streaming_listener: "backchannel",
               background_tasks: true,
             },
           } : {}),
@@ -446,7 +446,8 @@
         $("features").textContent = $("mode").value === "baseline"
           ? "Baseline turn handling"
           : [
-            features.interruption_policy === "semantic" ? "Semantic turn handling"
+            features.streaming_listener === "backchannel" ? "Quick turn-taking · brief nods keep playback going"
+              : features.interruption_policy === "semantic" ? "Semantic turn handling"
               : features.interruption_policy === "observe" ? "Listener observation only" : "Semantic listener unavailable",
             features.background_tasks ? "Background tasks enabled" : "Background tasks unavailable",
           ].join(" · ");
