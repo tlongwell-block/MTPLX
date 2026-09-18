@@ -134,7 +134,7 @@ def test_pending_call_does_not_block_user_and_active_reply_gets_immutable_snapsh
         await wait_for(lambda: len(e.calls) == 1)
         first = copy.deepcopy(e.calls[0])
         assert e.calls[0][1]["type"] == "function_call_output"
-        assert '"pending"' in e.calls[0][1]["output"]
+        assert '"event": "request_issued"' in e.calls[0][1]["output"]
         await output(s)
         assert e.calls[0] == first and not s.current.abort.is_set()
         await s.handle({"type": "response.create"})
@@ -219,7 +219,7 @@ def test_manual_spoken_input_works_while_tool_is_pending():
         await s.handle({"type": "response.create"})
         await wait_for(lambda: len(e.calls) == 1)
         assert e.calls[0][-1]["content"][0]["type"] == "input_audio"
-        assert '"pending"' in e.calls[0][1]["output"]
+        assert '"event": "request_issued"' in e.calls[0][1]["output"]
 
     asyncio.run(setup(check))
 
