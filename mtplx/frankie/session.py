@@ -51,6 +51,7 @@ class Response:
     chunks: list = field(default_factory=list)
     item: dict | None = None
     done: bool = False
+    status: str | None = None
     settings: dict = field(default_factory=dict)
     transcripts: list = field(default_factory=list)
     speech_end_ms: int = 0
@@ -78,6 +79,7 @@ class Session:
         self.closed = False
         self.tasks = set()
         self.task_ledger = TaskLedger()
+        self.task_history_count = 0
         self.input_revision = 0
         self.user_revision = 0
         self.response_revision = -1
@@ -231,8 +233,9 @@ class Session:
         self.response_revision = self.user_revision
         for call_id in run.task_results:
             task = self.task_ledger.tasks.get(call_id)
-            if task is not None:
-                task.consumed = True
+            if task is not None and task.status == "completed" and not task.consumed:
+                task.delivery_response_id = run.id
+                task.delivery_failed = False
         self.unhandled_task_results.difference_update(run.task_results)
         if not self.unhandled_task_results:
             self.queued_task_response = False
@@ -417,7 +420,9 @@ class Session:
                                    and item["call_id"] in deferred)]
             history = project_history(history)
             run.settings["instructions"] += "\n\n" + BACKGROUND_TASK_INSTRUCTIONS
-            run.task_results = self.unhandled_task_results - deferred
+            run.task_results = self.ready_task_results(
+                retry=input_item is not None or self.user_revision > self.response_revision
+            ) - deferred
             if input_item is None and self.response_revision == self.user_revision:
                 # A result may have arrived before an already captured user
                 # turn. Keep its data at that point in history, but identify
@@ -576,13 +581,44 @@ class Session:
             }
         if error:
             response["status_details"] = {"type": "failed", "error": {"message": error}}
+        run.status = status
+        self.settle_task_results(run)
         self.event("response.done", response=response)
         self.maybe_start_task_response()
+
+    def ready_task_results(self, *, retry=False):
+        return {call_id for call_id in self.unhandled_task_results
+                if (task := self.task_ledger.tasks.get(call_id)) is not None
+                and task.status == "completed" and not task.consumed
+                and task.delivery_response_id is None and (retry or not task.delivery_failed)}
+
+    def settle_task_results(self, run):
+        """Settle only this response's reservation, never spin on failed delivery."""
+        if not run.abort.is_set() and (not run.done or run.status is None):
+            return
+        audio = "audio" in run.settings.get("output_modalities", ())
+        delivered = (not run.abort.is_set() and run.status == "completed"
+                     and bool(run.text.strip()) and (not audio or run.emitted_ms > 0))
+        if delivered and audio and self.settings["playback_feedback"] and not run.playback_finished:
+            return
+        for call_id in run.task_results:
+            task = self.task_ledger.tasks.get(call_id)
+            if task is None or task.delivery_response_id != run.id:
+                continue  # A late old callback cannot settle a replacement attempt.
+            task.delivery_response_id = None
+            if task.status != "completed" or task.consumed:
+                continue
+            task.consumed = delivered
+            task.delivery_failed = not delivered
+            if not delivered:
+                self.unhandled_task_results.add(call_id)
+        if not self.ready_task_results():
+            self.queued_task_response = False
 
     def maybe_start_task_response(self):
         if (
             self.queued_task_response
-            and self.unhandled_task_results
+            and self.ready_task_results()
             and not self.closed
             and not self.listening
             and not self.manual_size
@@ -784,6 +820,7 @@ class Session:
         if run is not None and not run.done:
             run.abort.set()
             run.ready.set()
+            self.settle_task_results(run)
         return run
 
     def merge_resumed(self, run):
@@ -939,6 +976,7 @@ class Session:
         run.playback_paused = False
         run.abort.set()
         run.ready.set()
+        self.settle_task_results(run)
         if self.playback_wake is not None:
             self.playback_wake.cancel()
             self.playback_wake = None
@@ -1285,6 +1323,10 @@ class Session:
                 if type(extensions["playback_feedback"]) is not bool:
                     raise ValueError("playback_feedback must be a boolean.")
                 new["playback_feedback"] = extensions["playback_feedback"]
+                if (self.settings["playback_feedback"] and not new["playback_feedback"]
+                        and any(task.delivery_response_id is not None
+                                for task in self.task_ledger.tasks.values())):
+                    raise ValueError("Finish or cancel task-result playback before disabling feedback.")
             if "playback_pause" in extensions:
                 if type(extensions["playback_pause"]) is not bool:
                     raise ValueError("playback_pause must be a boolean.")
@@ -1313,6 +1355,11 @@ class Session:
                 if type(extensions["background_tasks"]) is not bool:
                     raise ValueError("background_tasks must be a boolean.")
                 new["background_tasks"] = extensions["background_tasks"]
+                if (new["background_tasks"] != self.settings["background_tasks"]
+                        and any(task.delivery_response_id is not None
+                                or (task.status == "completed" and not task.consumed)
+                                for task in self.task_ledger.tasks.values())):
+                    raise ValueError("Deliver or supersede completed task results before changing background mode.")
                 if not new["background_tasks"] and any(
                     task.status == "running" for task in self.task_ledger.tasks.values()
                 ):
@@ -1376,14 +1423,38 @@ class Session:
                 await self.loop.run_in_executor(
                     self.executor, lambda: self.engine.warm(new, session_id=self.id)
                 )
-            if new["background_tasks"] and not self.settings["background_tasks"]:
-                ledger = TaskLedger()
-                for item in self.items:
-                    if item["type"] == "function_call":
-                        ledger.register(item, self.input_revision)
-                    elif item["type"] == "function_call_output":
-                        ledger.complete(item["call_id"])
-                self.task_ledger = ledger
+            if new["background_tasks"] != self.settings["background_tasks"]:
+                # Only function items advance this cursor: resumed speech can
+                # delete ordinary history items, but never function history.
+                function_items = [item for item in self.items
+                                  if item["type"] in {"function_call", "function_call_output"}]
+                if new["background_tasks"]:
+                    ledger = copy.deepcopy(self.task_ledger)
+                    discarded = []
+                    for item in function_items[self.task_history_count:]:
+                        if item["type"] == "function_call":
+                            ledger.register(item, self.input_revision)
+                        elif item["call_id"] not in ledger.tasks:
+                            discarded.append(item)  # Expired cancellation tombstone.
+                        else:
+                            task, accepted = ledger.complete(item["call_id"])
+                            if accepted:
+                                # Legacy results are already conversation history,
+                                # not newly due background presentations.
+                                task.consumed = True
+                            else:
+                                discarded.append(item)
+                    # Commit only after every import passes admission checks.
+                    # Preserve known task identities and their delivery state.
+                    for call_id, task in ledger.tasks.items():
+                        known = self.task_ledger.tasks.get(call_id)
+                        if known is not None:
+                            vars(known).update(vars(task))
+                            ledger.tasks[call_id] = known
+                    for item in discarded:
+                        item["_task_discarded"] = True
+                    self.task_ledger = ledger
+                self.task_history_count = len(function_items)
             self.settings = new
             self.prefix_listener.allow_control = new["streaming_listener"] in {"semantic", "backchannel"}
             self.prefix_listener.interval_ms = 160 if new["streaming_listener"] == "backchannel" else 320
@@ -1516,6 +1587,13 @@ class Session:
                 if self.semantic_pending:
                     self.event("frankie.response.skipped", reason="semantic_turn_pending")
                     return
+                if self.current is None or self.current.done:
+                    # An explicit idle response request admits one retry.
+                    # Automatic followups never clear failed-attempt flags.
+                    for call_id in self.unhandled_task_results:
+                        task = self.task_ledger.tasks.get(call_id)
+                        if task is not None:
+                            task.delivery_failed = False
                 if (self.unhandled_task_results and self.audible_response() is not None
                         and (not self.user_revision or self.response_revision == self.user_revision)):
                     self.event("frankie.response.queued", reason="playback_pending")
@@ -1598,6 +1676,14 @@ class Session:
                 self.items.append(notice)
                 self.event("conversation.item.created", item=public(notice), previous_item_id=None)
                 self.unhandled_task_results.discard(task.call_id)
+                if self.spec is not None and task.call_id in self.spec.task_results:
+                    self.discard_spec()
+                if (self.current is not None and self.current.visible
+                        and task.call_id in self.current.task_results and not task.consumed):
+                    if self.current.emitted_ms > 0:
+                        self.rollback_unheard(self.current)
+                    else:
+                        self.cancel()
                 if not self.unhandled_task_results:
                     self.queued_task_response = False
             self.event(
@@ -1619,6 +1705,7 @@ class Session:
             run.played_ms = ms
             self.settings["playback_feedback"] = True
             if kind == "frankie.playback.finished":
+                self.settle_task_results(run)
                 self.maybe_start_task_response()
         elif kind == "conversation.item.truncate":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)

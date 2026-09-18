@@ -115,9 +115,11 @@ def test_pending_tool_result_does_not_start_speaking_during_long_user_turn():
         await wait_for(lambda: len(engine.calls) == 2)
         assert "LONG_TURN_RESULT_42" in str(engine.calls[1])
         assert not session.queued_task_response and not session.unhandled_task_results
-        assert session.task_ledger.tasks["lookup_1"].consumed
+        task = session.task_ledger.tasks["lookup_1"]
+        assert not task.consumed and task.delivery_response_id == session.current.id
         engine.releases[1].set()
         await wait_for(lambda: session.current.done)
+        assert task.consumed and task.delivery_response_id is None
         await session.handle({"type": "response.create"})
         session.maybe_start_task_response()
         await asyncio.sleep(0.01)

@@ -50,6 +50,9 @@ def test_task_ledger_bounds_pending_work_and_terminal_tombstones():
     ledger.complete("a")
     ledger.register(call("c"), 0)
     ledger.complete("c")
+    with pytest.raises(ValueError, match="undelivered"):
+        ledger.register(call("d"), 0)
+    ledger.tasks["a"].consumed = True
     ledger.register(call("d"), 0)
     assert set(ledger.tasks) == {"b", "c", "d"}
     assert ledger.tasks["b"].status == "running"

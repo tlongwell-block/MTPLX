@@ -34,6 +34,8 @@ class Task:
     status: str = "running"
     received: bool = False
     consumed: bool = False
+    delivery_response_id: str | None = None
+    delivery_failed: bool = False
 
     def public(self):
         return {
@@ -61,7 +63,10 @@ class TaskLedger:
         if sum(t.status == "running" for t in self.tasks.values()) >= self.max_pending:
             raise ValueError("Too many pending background tasks.")
         if len(self.tasks) >= self.max_entries:
-            terminal = next(k for k, t in self.tasks.items() if t.status != "running")
+            terminal = next((k for k, t in self.tasks.items()
+                             if t.status in {"cancelled", "superseded"} or t.consumed), None)
+            if terminal is None:
+                raise ValueError("Too many undelivered background task results.")
             del self.tasks[terminal]
         task = Task(call_id, item["name"], revision, response_id)
         self.tasks[call_id] = task

@@ -248,10 +248,12 @@ def test_result_before_listener_yield_waits_for_replacement_playback_then_runs_o
         })
         await wait_for(lambda: len(e.calls) == 2)
         assert "DELAYED_RESULT_42" in str(e.calls[1])
-        assert s.task_ledger.tasks["lookup_1"].consumed
+        assert not s.task_ledger.tasks["lookup_1"].consumed
+        assert s.task_ledger.tasks["lookup_1"].delivery_response_id == s.current.id
         assert not s.queued_task_response and not s.unhandled_task_results
         e.releases[1].set()
         await wait_for(lambda: s.current.done)
+        assert s.task_ledger.tasks["lookup_1"].consumed  # This fake emits text only.
         await s.handle({"type": "response.create"})
         await asyncio.sleep(0.01)
         assert len(e.calls) == 2
