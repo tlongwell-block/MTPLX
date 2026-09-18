@@ -81,9 +81,9 @@ function browser() {
   };
 }
 
-test("demo opts into reversible playback pause with heard-position feedback", () => {
+test("demo keeps acknowledgments uninterrupted while reporting heard position", () => {
   const b = browser(); b.api.settings();
-  assert.equal(b.sent.at(-1).session.frankie.playback_pause, true);
+  assert.equal(b.sent.at(-1).session.frankie.playback_pause, false);
   assert.equal(b.sent.at(-1).session.frankie.playback_feedback, true);
 });
 
