@@ -32,6 +32,7 @@ def render(items, *, actual_template=False):
 
     def apply(messages, **kwargs):
         captured["messages"] = copy.deepcopy(messages)
+        assert kwargs["preserve_thinking"] is False
         if template is not None:
             return template.render(messages=messages, **kwargs)
         return "\n".join(str(item) for item in messages)
@@ -41,7 +42,7 @@ def render(items, *, actual_template=False):
                           encode=lambda text, **kwargs: list(text.encode()))
     engine.vision_spec = NS(image_token_id=999)
     original = copy.deepcopy(items)
-    ids, splice = engine.prompt(items, {"instructions": "Speak naturally.", "thinking": "off"})
+    ids, splice = engine.prompt(items, {"instructions": "Speak naturally.", "thinking": "off"}, public_history=True)
     assert items == original and splice is None
     return captured["messages"], bytes(ids).decode()
 
@@ -117,3 +118,54 @@ def test_legitimate_silent_response_is_completed_once_and_not_retried():
         assert not any(event["type"].endswith(".delta") for event in events)
 
     asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("thinking", ["off", "on"])
+def test_public_history_does_not_invent_empty_reasoning_but_tool_cycle_stays_native(thinking):
+    path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
+            / "official-tokenizer-metadata" / "chat_template.jinja")
+    if not path.is_file():
+        pytest.skip("Private official tokenizer metadata is unavailable.")
+    utils = pytest.importorskip("transformers.utils.chat_template_utils")
+    template = utils._compile_jinja_template(path.read_text())
+    engine = Frankie.__new__(Frankie)
+    engine.tokenizer = NS(
+        apply_chat_template=lambda messages, **kw: template.render(messages=messages, **kw),
+        encode=lambda text, **kw: list(text.encode()))
+    engine.vision_spec = NS(image_token_id=999)
+    history = [message("user", "First question."), message("assistant", "First answer."),
+               message("user", "Look it up."),
+               {"type": "function_call", "call_id": "lookup-1", "name": "lookup", "arguments": "{}"},
+               {"type": "function_call_output", "call_id": "lookup-1", "output": "42"}]
+    ids, splice = engine.prompt(history, {"instructions": "Speak naturally.", "thinking": thinking}, public_history=True)
+    rendered = bytes(ids).decode()
+    assert splice is None
+    assert "<|im_start|>assistant\nFirst answer.<|im_end|>" in rendered
+    # Native formatting of the current tool cycle and generation header remains intact.
+    assert '<tool_call>' in rendered and '<tool_response>\n42\n</tool_response>' in rendered
+    prefix = "<|im_start|>assistant\n<think>\n"
+    assert rendered.endswith(prefix + ("\n</think>\n\n" if thinking == "off" else ""))
+    assert rendered.count("<think>") == 2  # tool call plus current generation, not old answer
+
+
+def test_closed_public_history_is_stable_when_generation_header_changes():
+    path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
+            / "official-tokenizer-metadata" / "chat_template.jinja")
+    if not path.is_file():
+        pytest.skip("Private official tokenizer metadata is unavailable.")
+    utils = pytest.importorskip("transformers.utils.chat_template_utils")
+    template = utils._compile_jinja_template(path.read_text())
+    engine = Frankie.__new__(Frankie)
+    engine.tokenizer = NS(
+        apply_chat_template=lambda messages, **kw: template.render(messages=messages, **kw),
+        encode=lambda text, **kw: list(text.encode()))
+    engine.vision_spec = NS(image_token_id=999)
+    settings = {"instructions": "Speak naturally.", "thinking": "off"}
+    first = [message("user", "A question."), message("assistant", "An answer."),
+             message("user", "Tell me more.")]
+    closed, _ = engine.prompt(first, settings, generation_prompt=False, public_history=True)
+    opened, _ = engine.prompt(first, settings, public_history=True)
+    following = first + [message("assistant", "Here is more detail."), message("user", "Continue.")]
+    next_ids, _ = engine.prompt(following, settings, public_history=True)
+    assert opened[:len(closed)] == next_ids[:len(closed)] == closed
+    assert next_ids[:len(opened)] != opened

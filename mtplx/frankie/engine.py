@@ -70,7 +70,7 @@ class Frankie:
                 transcripts.append((item, index, part["_transcript"]))
         return transcripts
 
-    def prompt(self, items, settings, *, generation_prompt=True, emit=None):
+    def prompt(self, items, settings, *, generation_prompt=True, emit=None, public_history=False):
         instructions = settings["instructions"]
         if settings.get("streaming_listener", "off") != "off" or any(
                 item.get("_playback_interrupted") or "_interrupted_draft" in item for item in items):
@@ -163,6 +163,9 @@ class Frankie:
             tokenize=False,
             add_generation_prompt=generation_prompt,
             enable_thinking=settings.get("thinking", "off") != "off",
+            # Realtime history contains public speech, not saved reasoning.
+            # Do not synthesize empty thinking blocks for completed turns.
+            **({"preserve_thinking": False} if public_history else {}),
         )
         pad = self.vision_spec.image_token_id
         ids, all_rows, digests, counts = [], [], [], []
@@ -209,17 +212,22 @@ class Frankie:
         # system/tool prefix; the synthetic user never enters the cache.
         start = self.tokenizer.encode("<|im_start|>", add_special_tokens=False)[0]
         ids = ids[: max(i for i, t in enumerate(ids) if t == start)]
-        generate_mtpk(
+        self.cache_prompt(ids, None, session_id=session_id, bank=bank)
+
+    def cache_prompt(self, ids, splice, *, session_id, bank=None, abort_check=None):
+        return generate_mtpk(
             self.runtime,
             ids,
             max_tokens=0,
             sampler=SamplerConfig(temperature=0),
             speculative_depth=max(1, self.mtp),
-            mtp_history_policy="committed",
+            mtp_history_policy="committed" if self.mtp else "cycle",
             verify_strategy="capture_commit",
             session_bank=self.bank if bank is None else bank,
             session_id=session_id,
             commit_prompt_state_to_bank=True,
+            vision_splice=splice,
+            abort_check=abort_check,
         )
 
     def respond(self, items, settings, emit, abort, *, session_id):
@@ -231,9 +239,20 @@ class Frankie:
 
         check_abort()
         self.audio.reset_speech_context()
-        ids, splice = self.prompt(items, settings, emit=emit)
+        ids, splice = self.prompt(items, settings, emit=emit, public_history=True)
         if len(ids) + settings["max_output_tokens"] > settings.get("context", 131072):
             raise ValueError("Conversation exceeds the configured context limit.")
+        history_prefill = None
+        if self.bank is not None:
+            # The open thinking header changes when this becomes public history.
+            # Bank the closed history instead, so the next turn can reuse every
+            # completed audio span without restoring across a rewritten header.
+            history_ids, history_splice = self.prompt(
+                items, settings, generation_prompt=False, public_history=True
+            )
+            history_prefill = self.cache_prompt(
+                history_ids, history_splice, session_id=session_id, abort_check=abort.is_set
+            ).stats.to_dict()
         text_ids = []
         speech_ids = []
         speech_states = []
@@ -440,7 +459,7 @@ class Frankie:
                         mtp_history_policy="committed",
                         verify_strategy="capture_commit",
                         token_callback=callback,
-                        commit_prompt_state_to_bank=True,
+                        commit_prompt_state_to_bank=False,
                         **options,
                     )
                 else:
@@ -457,10 +476,15 @@ class Frankie:
                     emit("text", tail)
                 chunk()
                 step_audio(force=True)
+            stats = result.stats.to_dict()
+            if history_prefill is not None:
+                stats["history_prefill"] = {key: history_prefill.get(key) for key in (
+                    "cached_tokens", "new_prefill_tokens", "session_cache_hit",
+                    "prompt_eval_time_s", "elapsed_s")}
             return {
                 "text": all_text,
                 "raw_text": self.tokenizer.decode(text_ids),
-                "stats": result.stats.to_dict(),
+                "stats": stats,
                 "finish_reason": result.finish_reason,
                 "audio_seconds": audio_seconds,
                 "chunks": marks,
