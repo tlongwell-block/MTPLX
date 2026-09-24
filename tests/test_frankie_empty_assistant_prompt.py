@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import os
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -23,10 +24,9 @@ def render(items, *, actual_template=False):
     captured = {}
     template = None
     if actual_template:
-        path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
-                / "official-tokenizer-metadata" / "chat_template.jinja")
+        path = Path(os.environ.get("FRANKIE_TEST_CHAT_TEMPLATE", ""))
         if not path.is_file():
-            pytest.skip("Private official tokenizer metadata is unavailable.")
+            pytest.skip("Set FRANKIE_TEST_CHAT_TEMPLATE to the brain tokenizer chat_template.jinja.")
         utils = pytest.importorskip("transformers.utils.chat_template_utils")
         template = utils._compile_jinja_template(path.read_text())
 
@@ -122,10 +122,9 @@ def test_legitimate_silent_response_is_completed_once_and_not_retried():
 
 @pytest.mark.parametrize("thinking", ["off", "on"])
 def test_public_history_does_not_invent_empty_reasoning_but_tool_cycle_stays_native(thinking):
-    path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
-            / "official-tokenizer-metadata" / "chat_template.jinja")
+    path = Path(os.environ.get("FRANKIE_TEST_CHAT_TEMPLATE", ""))
     if not path.is_file():
-        pytest.skip("Private official tokenizer metadata is unavailable.")
+        pytest.skip("Set FRANKIE_TEST_CHAT_TEMPLATE to the brain tokenizer chat_template.jinja.")
     utils = pytest.importorskip("transformers.utils.chat_template_utils")
     template = utils._compile_jinja_template(path.read_text())
     engine = Frankie.__new__(Frankie)
@@ -149,10 +148,9 @@ def test_public_history_does_not_invent_empty_reasoning_but_tool_cycle_stays_nat
 
 
 def test_closed_public_history_is_stable_when_generation_header_changes():
-    path = (Path(__file__).resolve().parents[3] / "v4-frontier" / "lora-qualification"
-            / "official-tokenizer-metadata" / "chat_template.jinja")
+    path = Path(os.environ.get("FRANKIE_TEST_CHAT_TEMPLATE", ""))
     if not path.is_file():
-        pytest.skip("Private official tokenizer metadata is unavailable.")
+        pytest.skip("Set FRANKIE_TEST_CHAT_TEMPLATE to the brain tokenizer chat_template.jinja.")
     utils = pytest.importorskip("transformers.utils.chat_template_utils")
     template = utils._compile_jinja_template(path.read_text())
     engine = Frankie.__new__(Frankie)

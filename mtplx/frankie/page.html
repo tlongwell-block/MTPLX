@@ -202,6 +202,7 @@
             <option>low</option>
             <option>medium</option>
             <option>high</option>
+            <option value="xhigh">Extra high</option>
           </select></label
         ><label
           ><input type="checkbox" id="speak" checked />Speak responses</label
@@ -332,12 +333,13 @@
         type: "session.update",
         session: {
           thinking,
-          max_output_tokens:
+          max_output_tokens: Math.min(8192,
             512 +
-            { off: 0, minimal: 64, low: 256, medium: 1024, high: 4096 }[
+            { off: 0, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 16384 }[
               thinking
-            ],
+            ]),
           output_modalities: [$("speak").checked ? "audio" : "text"],
+          instructions: "You are Frankie, a helpful voice assistant. Everything you say is spoken aloud. Use natural, unformatted conversational language. Be clear and concise, and never claim to have done work before doing it.",
           tools: $("demoTool").checked ? [demoTool] : [],
           ...($("demoTool").checked ? {
             instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information." +
