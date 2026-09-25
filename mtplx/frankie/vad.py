@@ -24,9 +24,11 @@ class SileroVAD(nn.Module):
         self.reset()
 
     def reset(self):
-        self._h = mx.zeros((1, 128))
-        self._c = mx.zeros((1, 128))
-        self._ctx = mx.zeros((1, self.CTX))
+        # These are lazy: a GPU reset would make the next CPU audio frame
+        # wait behind unrelated brain/mouth work on the default stream.
+        self._h = mx.zeros((1, 128), stream=mx.cpu)
+        self._c = mx.zeros((1, 128), stream=mx.cpu)
+        self._ctx = mx.zeros((1, self.CTX), stream=mx.cpu)
 
     def prepare(self):
         self._WxT, self._WhT, self._fwT = (
