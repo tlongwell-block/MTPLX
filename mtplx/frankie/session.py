@@ -6,6 +6,8 @@ import asyncio
 import base64
 import copy
 import json
+import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -28,6 +30,14 @@ from .tasks import (
 
 def identifier(prefix):
     return prefix + "_" + uuid.uuid4().hex[:20]
+
+
+def snapshot_history(history):
+    """Freeze assistant playback edits; share immutable user media features."""
+    return [{**item, "content": [dict(p) for p in item.get("content", [])],
+             **({"_interrupted_draft": dict(item["_interrupted_draft"])}
+                if "_interrupted_draft" in item else {})}
+            if item.get("role") == "assistant" else item for item in history]
 
 
 def public(item):
@@ -82,6 +92,9 @@ class Session:
         self.spec = None
         self.closed = False
         self.tasks = set()
+        self.history_prefill_enabled = os.environ.get("MTPLX_FRANKIE_IDLE_HISTORY_PREFILL") == "1"
+        self.history_prefill_abort = Event()
+        self.history_prefill_run = None
         self.task_ledger = TaskLedger()
         self.task_history_count = 0
         self.input_revision = 0
@@ -214,6 +227,48 @@ class Session:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         return task
+
+    def prepare_idle_history(self):
+        """Best-effort prefix work after confirmed playback, yielding to input."""
+        run = self.current
+
+        def idle():
+            return (not self.closed and not self.listening and not self.manual_size
+                    and not self.semantic_pending and not self.queued_task_response
+                    and not self.settings["background_tasks"]
+                    and self.user_revision == self.response_revision
+                    and self.current is run and run is not None and run.done
+                    and not run.abort.is_set() and run.playback_finished
+                    and not run.tool_items and run.item is not None
+                    and run.item.get("status") == "completed"
+                    and not (self.listener is not None and self.listener.service.jobs))
+
+        if (not self.history_prefill_enabled or self.history_prefill_run is run
+                or not idle()):
+            return
+        # Tiny replies save little but still incur a model pass. Keep the
+        # normal foreground path for them, with no added cache work.
+        words = sum(len(p.get("transcript", p.get("text", "")).split())
+                    for p in run.item.get("content", []))
+        if words < 24:
+            return
+        self.history_prefill_run = run
+        abort = self.history_prefill_abort = Event()
+        history, settings = snapshot_history(self.items), copy.deepcopy(self.settings)
+
+        def interrupted():
+            return abort.is_set() or not idle()
+
+        async def prepare():
+            try:
+                await self.loop.run_in_executor(self.executor, lambda: self.engine.warm(
+                    settings, session_id=self.id, history=history,
+                    abort_check=interrupted, prefill_step_size=lambda: 32))
+            except Exception:  # Best effort; normal prefill remains authoritative.
+                if not interrupted():
+                    logging.getLogger(__name__).warning("Idle history prefill failed", exc_info=True)
+
+        self.spawn(prepare())
 
     def show(self, run):
         if run.visible or run.abort.is_set():
@@ -432,6 +487,7 @@ class Session:
                 )
 
     def start(self, input_item=None, *, tentative=False, deferred_task_results=None):
+        self.history_prefill_abort.set()
         if (
             self.current is not None
             and not self.current.done
@@ -464,10 +520,7 @@ class Session:
         # Freeze the playback frontier for this generation. Device callbacks
         # may refine the authoritative old item while this prompt is queued.
         # User audio remains shared for the existing immutable feature cache.
-        history = [{**item, "content": [dict(p) for p in item.get("content", [])],
-                    **({"_interrupted_draft": dict(item["_interrupted_draft"])}
-                       if "_interrupted_draft" in item else {})}
-                   if item.get("role") == "assistant" else item for item in history]
+        history = snapshot_history(history)
         if self.settings["background_tasks"]:
             # An already captured audio turn gets its answer first. A
             # result queued while that turn was being classified belongs to a
@@ -1122,6 +1175,7 @@ class Session:
         td = self.settings["turn_detection"]
         rate = self.settings["input_rate"]
         if td is None:
+            self.history_prefill_abort.set()
             if not self.manual_size:
                 self.capture_context = self.next_context()
                 self.capture_task_results = tuple(
@@ -1150,6 +1204,7 @@ class Session:
             voiced = probability >= td.get("threshold", 0.5)
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
+                self.history_prefill_abort.set()
                 self.invalidate_semantics()
                 self.capture_task_results = tuple(
                     call_id for call_id in self.task_ledger.tasks
@@ -1333,6 +1388,10 @@ class Session:
 
     async def handle(self, event):
         kind = event["type"]
+        if (kind.startswith("conversation.") or kind in {
+                "session.update", "response.create", "response.cancel",
+                "input_audio_buffer.commit", "input_audio_buffer.clear", "frankie.voice.update"}):
+            self.history_prefill_abort.set()
         if kind == "frankie.input_context.update":
             revision, text = event["revision"], event["text"]
             if (
@@ -1751,6 +1810,7 @@ class Session:
             if kind == "frankie.playback.finished":
                 self.settle_task_results(run)
                 self.maybe_start_task_response()
+                self.prepare_idle_history()
         elif kind == "conversation.item.truncate":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)
             run = self.playback_runs.get(event["item_id"], self.current)

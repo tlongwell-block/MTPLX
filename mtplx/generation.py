@@ -8084,6 +8084,7 @@ def generate_mtpk(
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
     prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    prefill_step_size: Callable[[], int] | None = None,
     repetition_stop: bool = False,
     loop_guard: bool = False,
     thinking_guard: ThinkingGuardConfig | None = None,
@@ -8565,6 +8566,7 @@ def generate_mtpk(
         draft_head_identity=session_draft_head_identity,
         policy_fingerprint=session_policy_fingerprint,
         prefill_callback=prefill_callback,
+        prefill_step_size=prefill_step_size,
         # kvcache-v2: client disconnect aborts the prefill through the same
         # chunk-granular check the postcommit path uses — an abandoned agent
         # request must not pin the GPU for a full long-context prefill

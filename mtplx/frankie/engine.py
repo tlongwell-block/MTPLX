@@ -200,9 +200,12 @@ class Frankie:
         )
         return ids, splice
 
-    def warm(self, settings, *, session_id, bank=None):
-        ids, _ = self.prompt(
-            [
+    def warm(self, settings, *, session_id, bank=None, history=(),
+             abort_check=None, prefill_step_size=None):
+        if abort_check is not None and abort_check():
+            return
+        ids, splice = self.prompt(
+            list(history) + [
                 {
                     "type": "message",
                     "role": "user",
@@ -211,14 +214,20 @@ class Frankie:
             ],
             settings,
             generation_prompt=False,
+            public_history=True,
         )
         # The checkpoint template requires a user query. Keep only its exact
-        # system/tool prefix; the synthetic user never enters the cache.
+        # history prefix; the synthetic user never enters the cache. Rendering
+        # with a next user also gives old assistant messages their history form.
         start = self.tokenizer.encode("<|im_start|>", add_special_tokens=False)[0]
         ids = ids[: max(i for i, t in enumerate(ids) if t == start)]
-        self.cache_prompt(ids, None, session_id=session_id, bank=bank)
+        if len(ids) >= settings.get("context", 131072):
+            return
+        return self.cache_prompt(ids, splice, session_id=session_id, bank=bank,
+                                 abort_check=abort_check, prefill_step_size=prefill_step_size)
 
-    def cache_prompt(self, ids, splice, *, session_id, bank=None, abort_check=None):
+    def cache_prompt(self, ids, splice, *, session_id, bank=None, abort_check=None,
+                     prefill_step_size=None):
         return generate_mtpk(
             self.runtime,
             ids,
@@ -232,6 +241,7 @@ class Frankie:
             commit_prompt_state_to_bank=True,
             vision_splice=splice,
             abort_check=abort_check,
+            prefill_step_size=prefill_step_size,
         )
 
     def respond(self, items, settings, emit, abort, *, session_id):

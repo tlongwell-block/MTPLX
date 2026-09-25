@@ -141,6 +141,17 @@ resident, the longest retained history used 86.5 MB and increased overall peak
 active memory by about 9.9 MB versus independent chunks. These are measurements
 of that workload, not a bound on total server memory.
 
+For brain history, `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=1` enables optional idle
+prefix preparation using the existing session cache. After a client confirms
+playback has finished, completed replies of at least 24 words can be prepared
+before the next user turn. This moves history processing off the next turn's
+critical path without removing that work or changing model weights, sampling,
+or mouth settings.
+The optimization is off by default, requires `frankie.playback.finished`, and
+skips background-task mode and pending input/HTTP work. New input, settings or
+requests cancel unfinished work at bounded prefill chunks. Tiny replies use the
+ordinary path without an extra pass. No new model weights or cache bank are added.
+
 For a brain finetune, change `brain_source` and run Forge again with that
 checkpoint's MTP head. The currently trained Frankie adapters expect the
 compatible 27B architecture and layer-16 features. A different architecture or
@@ -215,7 +226,7 @@ clear/false-start recovery retain undelivered context. Transcription events use
 the audio part's actual content index.
 
 Connect a Realtime client to `ws://127.0.0.1:18870/v1/realtime` with
-`Authorization: Bearer YOUR_TOKEN`. The page uses the equivalent WebSocket
+an `Authorization` bearer header using the `MTPLX_FRANKIE_TOKEN` value. The page uses the equivalent WebSocket
 subprotocol authentication. Audio output is mono PCM16 at 24 kHz; input accepts
 16 or 24 kHz, configured through `session.update`.
 
