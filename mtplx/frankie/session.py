@@ -438,11 +438,12 @@ class Session:
             and not self.current.abort.is_set()
         ):
             raise ValueError("A response is already active.")
-        # A completed generation can still have unheard audio. Explicit new
-        # user/manual responses replace that tail before taking their snapshot;
-        # result-only followups wait for drain in maybe_start_task_response.
+        # Only playback feedback establishes an unheard tail at a new turn.
+        # Without it, the drain deadline is a scheduling estimate, not permission
+        # to erase history. Those clients signal interruptions via cancel/truncate.
+        # Result-only followups wait for drain in maybe_start_task_response.
         audible = self.audible_response()
-        if audible is not None:
+        if audible is not None and self.settings["playback_feedback"]:
             self.rollback_unheard(audible)
         if input_item is None and self.user_revision > self.response_revision:
             latest_user = next((item for item in reversed(self.items)
@@ -496,6 +497,8 @@ class Session:
                     for item in history if item["type"] == "function_call"
                     and item["call_id"] in run.task_results
                 ])
+        else:
+            run.task_results = self.ready_task_results()
         if tentative:
             self.spec = run
             self.metrics["speculations"] += 1
@@ -614,6 +617,8 @@ class Session:
         self.maybe_start_task_response()
 
     def ready_task_results(self, *, retry=False):
+        if not self.settings["background_tasks"]:
+            return set(self.unhandled_task_results)
         return {call_id for call_id in self.unhandled_task_results
                 if (task := self.task_ledger.tasks.get(call_id)) is not None
                 and task.status == "completed" and not task.consumed
@@ -1386,6 +1391,8 @@ class Session:
                 if type(extensions["background_tasks"]) is not bool:
                     raise ValueError("background_tasks must be a boolean.")
                 new["background_tasks"] = extensions["background_tasks"]
+                if new["background_tasks"] != self.settings["background_tasks"] and self.queued_task_response:
+                    raise ValueError("Deliver or cancel the queued task response before changing background mode.")
                 if (new["background_tasks"] != self.settings["background_tasks"]
                         and any(task.delivery_response_id is not None
                                 or (task.status == "completed" and not task.consumed)
@@ -1485,6 +1492,7 @@ class Session:
                     for item in discarded:
                         item["_task_discarded"] = True
                     self.task_ledger = ledger
+                    self.unhandled_task_results.clear()
                 self.task_history_count = len(function_items)
             self.settings = new
             self.prefix_listener.allow_control = new["streaming_listener"] in {"semantic", "backchannel"}
@@ -1496,6 +1504,7 @@ class Session:
                 self.pause_playback(self.current, False)
             self.reset_detectors()
             self.event("session.updated", session=self.info())
+            self.maybe_start_task_response()
         elif kind == "conversation.item.create":
             # JSON items are copied recursively; private history/feature state
             # and trusted status provenance can only be produced by the server.
@@ -1580,6 +1589,8 @@ class Session:
                     self.event(
                         "frankie.task.updated", task=task.public(), result_discarded=not accepted
                     )
+                else:
+                    self.unhandled_task_results.add(item["call_id"])
             else:
                 raise ValueError("Unsupported conversation item type.")
             if item["type"] == "message" and item["role"] == "user":
@@ -1602,7 +1613,7 @@ class Session:
                 self.event("frankie.response.skipped", reason="user_requested_silence")
                 return
             if self.settings["streaming_listener"] != "off" and self.listening:
-                if self.settings["background_tasks"] and self.unhandled_task_results:
+                if self.unhandled_task_results:
                     self.queued_task_response = True
                 self.event("frankie.response.skipped", reason="user_turn_pending")
                 return
@@ -1626,11 +1637,6 @@ class Session:
                         task = self.task_ledger.tasks.get(call_id)
                         if task is not None:
                             task.delivery_failed = False
-                if (self.unhandled_task_results and self.audible_response() is not None
-                        and (not self.user_revision or self.response_revision == self.user_revision)):
-                    self.event("frankie.response.queued", reason="playback_pending")
-                    self.maybe_start_task_response()
-                    return
                 if self.current and not self.current.done and not self.current.abort.is_set():
                     if self.unhandled_task_results:
                         self.event("frankie.response.queued", reason="background_task_result")
@@ -1641,6 +1647,12 @@ class Session:
                 elif self.response_revision == self.user_revision and not self.unhandled_task_results:
                     self.event("frankie.response.skipped", reason="no_new_input")
                     return
+            if (self.unhandled_task_results and self.audible_response() is not None
+                    and (not self.user_revision or self.response_revision == self.user_revision)):
+                self.queued_task_response = True
+                self.event("frankie.response.queued", reason="playback_pending")
+                self.maybe_start_task_response()
+                return
             self.start()
         elif kind == "response.cancel":
             run = self.current
