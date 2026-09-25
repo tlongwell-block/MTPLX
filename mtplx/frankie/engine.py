@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -13,6 +12,7 @@ from itertools import repeat
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 
 from mtplx.features import CommittedFeatures
 from mtplx.generation import generate_ar, generate_mtpk
@@ -24,6 +24,7 @@ from mtplx.vision.processing import decode_image, preprocess_images
 from mtplx.vision.splice import VisionSplice
 
 from .audio import AudioModels
+from .detokenizing import new_detokenizer
 from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
 from .sampling import brain_sampler, thinking_guard
 from .thinking import public_tool_calls
@@ -123,7 +124,17 @@ class Frankie:
                         part["_rows"] = self.image(part["_bytes"])
                     rows = part["_rows"]
                     marker = f"{{{{frankie_media_{len(media)}}}}}"
-                    media.append((marker, rows))
+                    # Prepared audio/image rows are immutable. Keep their cache
+                    # identity with the rows, not a request or positional index.
+                    identity = part.get("_rows_identity")
+                    if identity is None or identity[0] is not rows:
+                        digest = hashlib.sha256(
+                            memoryview(np.asarray(rows.astype(mx.float32)))
+                        ).digest()
+                        identity = part["_rows_identity"] = (
+                            rows, int.from_bytes(digest[:8], "little")
+                        )
+                    media.append((marker, rows, identity[1]))
                     parts.append(
                         ("<|vision_start|>" + marker + "<|vision_end|>")
                         if part["type"] == "input_image"
@@ -169,25 +180,18 @@ class Frankie:
         )
         pad = self.vision_spec.image_token_id
         ids, all_rows, digests, counts = [], [], [], []
-        for marker, rows in media:
+        for marker, rows, digest in media:
             before, prompt = prompt.split(marker, 1)
             ids.extend(self.tokenizer.encode(before, add_special_tokens=False))
             ids.extend([pad] * len(rows))
             all_rows.append(rows)
             counts.append(len(rows))
-            digests.append(
-                int.from_bytes(
-                    hashlib.sha256(
-                        memoryview(__import__("numpy").asarray(rows.astype(mx.float32)))
-                    ).digest()[:8],
-                    "little",
-                )
-            )
+            digests.append(digest)
         ids.extend(self.tokenizer.encode(prompt, add_special_tokens=False))
         splice = (
             VisionSplice(
                 pad,
-                mx.concatenate(all_rows),
+                all_rows[0] if len(all_rows) == 1 else mx.concatenate(all_rows),
                 image_digests=tuple(digests),
                 pad_counts=tuple(counts),
             )
@@ -271,8 +275,7 @@ class Frankie:
         chunk_start = 0.0
         marks = []
         mouth_enabled = "audio" in settings["output_modalities"]
-        detokenizer = copy.copy(self.tokenizer.detokenizer)
-        detokenizer.reset()
+        detokenizer = new_detokenizer(self)
 
         def chunk():
             nonlocal speech_ids, speech_states

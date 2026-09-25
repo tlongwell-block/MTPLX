@@ -5,7 +5,6 @@ boundaries; an idle executor advances the same bounded steps between turns.
 """
 
 import asyncio
-import copy
 import contextvars
 import hmac
 import json
@@ -16,6 +15,7 @@ import time
 import uuid
 from collections import deque
 
+from .detokenizing import new_detokenizer
 from .sampling import brain_sampler, thinking_guard, thinking_mode
 
 
@@ -89,7 +89,6 @@ class Completions:
         self.driver = None
         self.listener_bank = None
         self.listener_prefixes = set()
-        self.detokenizer_template = None
         self.listener_detokenizer_primed = False
 
     def submit(self, data, chat, *, internal=False, prepare=None, prepare_only=False, urgent=False):
@@ -147,19 +146,7 @@ class Completions:
                 "listener_owner_max_slice_ms": round(getattr(job, "owner_max_slice_ms", 0.0), 3)}
 
     def new_detokenizer(self):
-        # TokenizerWrapper.detokenizer constructs a fresh vocabulary map on
-        # every access. Stock BPE.reset replaces all mutable request state;
-        # its tokenmap/byte decoder are read-only and safe to share. Other
-        # detokenizer implementations retain their existing construction path.
-        from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
-        template = getattr(self, "detokenizer_template", None)
-        if template is None:
-            template = self.engine.tokenizer.detokenizer
-            if type(template) is BPEStreamingDetokenizer:
-                self.detokenizer_template = template
-        result = copy.copy(template)
-        result.reset()
-        return result
+        return new_detokenizer(self.engine)
 
     def run_preparation(self, job):
         try:

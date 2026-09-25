@@ -143,11 +143,13 @@ def test_bpe_template_reuses_vocab_but_isolates_all_request_buffers():
     second.finalize()
     assert first.text == "Hi" and second.text == "Bye"
     assert first.tokens == [0, 1] and second.tokens == [2, 3, 4]
-    assert first.tokenmap is second.tokenmap is service.detokenizer_template.tokenmap
-    third = service.new_detokenizer()
+    assert first.tokenmap is second.tokenmap is service.engine.detokenizer_template.tokenmap
+    # The realtime engine uses this same factory and brain-owned table.
+    from mtplx.frankie.detokenizing import new_detokenizer
+    third = new_detokenizer(service.engine)
     assert tokenizer.constructions == 1
     assert third.tokens == [] and third.text == "" and third._unflushed == "" and third.offset == 0
-    assert service.detokenizer_template.tokens == [] and service.detokenizer_template.text == ""
+    assert service.engine.detokenizer_template.tokens == [] and service.engine.detokenizer_template.text == ""
 
 
 def test_unknown_detokenizer_keeps_previous_fresh_construction_behavior():
@@ -161,7 +163,7 @@ def test_unknown_detokenizer_keeps_previous_fresh_construction_behavior():
     service = c.Completions.__new__(c.Completions)
     service.engine = NS(tokenizer=tokenizer)
     assert service.new_detokenizer() is not service.new_detokenizer()
-    assert tokenizer.constructions == 2 and getattr(service, "detokenizer_template", None) is None
+    assert tokenizer.constructions == 2 and getattr(service.engine, "detokenizer_template", None) is None
 
 
 def test_owner_warm_primes_bpe_template_once_before_first_live_request():
@@ -182,7 +184,7 @@ def test_owner_warm_primes_bpe_template_once_before_first_live_request():
     service.warm_listener()
     request = service.new_detokenizer()
     assert tokenizer.constructions == 1
-    assert request.tokenmap is service.detokenizer_template.tokenmap
+    assert request.tokenmap is service.engine.detokenizer_template.tokenmap
     assert request.tokens == [] and request.text == ""
 
 
