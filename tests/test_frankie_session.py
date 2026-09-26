@@ -721,3 +721,45 @@ def test_speculative_acknowledgment_cannot_execute_a_tool_before_commit(commit):
             s.show(run)
             assert not run.tool_items and not drain(s)
     asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("start", [0, 3696, 6000])
+def test_resumed_audio_stitches_overlapping_preroll_without_duplicate_samples(start):
+    import time
+
+    async def check(s):
+        recording = np.arange(9000, dtype=np.float32)
+        s.received_ms = 6000 / 24
+        original = s.audio_item(recording[:6000], speech_end_ms=150)
+        assert original["_pcm_end_sample"] == 6000
+        assert "_pcm_end_sample" not in public(original)
+        run = Response(input=original, visible=True, committed_at=time.monotonic(),
+                       speech_end_ms=150)
+        run.abort.set()
+        s.items = [original, {"id": run.item_id, "type": "message", "role": "assistant"}]
+        s.received_ms = 9200 / 24
+        s.tail = recording[:200]  # Received but not yet processed by VAD.
+        s.frames = [recording[start:9000]]
+        s.speech_start_ms = 200
+        s.merge_resumed(run)
+        assert run.merged
+        np.testing.assert_array_equal(np.concatenate(s.frames), recording)
+    asyncio.run(setup(check))
+
+
+def test_resume_does_not_concatenate_different_sample_rates():
+    import time
+
+    async def check(s):
+        original = s.audio_item(np.ones(1000))
+        original["content"][0]["_rate"] = 16000
+        run = Response(input=original, visible=True, committed_at=time.monotonic(),
+                       speech_end_ms=100)
+        run.abort.set()
+        s.items = [original, {"id": run.item_id, "type": "message", "role": "assistant"}]
+        s.frames = [np.zeros(1000)]
+        s.speech_start_ms = 200
+        s.merge_resumed(run)
+        assert not run.merged and len(s.items) == 2
+        assert len(s.frames) == 1
+    asyncio.run(setup(check))

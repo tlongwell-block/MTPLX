@@ -941,11 +941,19 @@ class Session:
             for item in self.items[index:]
         ):
             return
+        previous = next(p for p in run.input["content"] if p["type"] == "input_audio")
+        if previous.get("_rate", 24000) != self.settings["input_rate"]:
+            return
+        pcm = previous["_pcm"]
+        end = run.input.get("_pcm_end_sample")
+        if end is not None:
+            # New pre-roll can overlap the frozen first utterance. Preserve
+            # each recorded sample once when stitching an immediate resume.
+            start = self.audio_position() - sum(len(frame) for frame in self.frames)
+            overlap = max(0, end - start)
+            pcm = pcm[:max(0, len(pcm) - overlap)]
         run.merged = True
-        self.frames.insert(
-            0,
-            next(p["_pcm"] for p in run.input["content"] if p["type"] == "input_audio"),
-        )
+        self.frames.insert(0, pcm)
         self.capture_context = run.input.get("_capture_context", (0, ""))
         removed = {run.input["id"], run.item_id}
         self.items = [item for item in self.items if item["id"] not in removed]
@@ -961,6 +969,9 @@ class Session:
         self.metrics["speculation_aborts"] += 1
         self.event("frankie.speculation.aborted", response_id=self.spec.id)
         self.spec = None
+
+    def audio_position(self):
+        return round(self.received_ms * self.settings["input_rate"] / 1000) - len(self.tail)
 
     def audio_item(self, pcm, *, item_id=None, speech_end_ms=None):
         item = {
@@ -979,6 +990,7 @@ class Session:
         item["_capture_context"] = self.capture_context
         item["_task_results_at_capture"] = self.capture_task_results
         if speech_end_ms is not None:
+            item["_pcm_end_sample"] = self.audio_position()
             item["_speech_start_ms"] = self.speech_start_ms
             item["_speech_end_ms"] = speech_end_ms
             item["_speech_voiced_ms"] = self.speech_voiced_ms
