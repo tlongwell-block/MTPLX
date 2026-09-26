@@ -64,6 +64,8 @@ class Response:
     status: str | None = None
     settings: dict = field(default_factory=dict)
     transcripts: list = field(default_factory=list)
+    preview_text: list = field(default_factory=list)
+    preview_chars: int = 0
     speech_end_ms: int = 0
     played_ms: int = 0
     merged: bool = False
@@ -340,6 +342,9 @@ class Session:
             content_index=0,
             part=public(run.item["content"][0]),
         )
+        for value in run.preview_text:
+            self.publish(run, "text", value)
+        run.preview_text.clear()
         run.ready.set()
         for key, call in tuple(run.tool_candidates.items()):
             self.publish_tool(run, key, call)
@@ -347,7 +352,13 @@ class Session:
     def emit(self, run, kind, value):
         # Transcription must not stall speculative brain prefill. Hold its
         # event on the event-loop side until the same utterance is committed.
-        if kind not in {"input_transcript", "tool_call"}:
+        # Prepare one speech chunk privately while turn release is pending.
+        # Audio still blocks below; text-only responses retain their gate.
+        preview = (kind == "text" and "audio" in run.settings.get("output_modalities", [])
+                   and not run.ready.is_set() and run.preview_chars + len(value) <= 4096)
+        if preview:
+            run.preview_chars += len(value)
+        if not preview and kind not in {"input_transcript", "tool_call"}:
             while not run.ready.wait(0.01):
                 if run.abort.is_set() or self.closed:
                     return
@@ -372,6 +383,9 @@ class Session:
                 self.transcribed(*value)
             else:
                 run.transcripts.append(value)
+            return
+        if kind == "text" and not run.visible:
+            run.preview_text.append(value)
             return
         common = {
             "response_id": run.id,

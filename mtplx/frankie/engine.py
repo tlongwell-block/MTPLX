@@ -345,10 +345,12 @@ class Frankie:
                     continue
                 if abort.is_set():
                     return
-                if audio_start is None:
-                    audio_start = time.monotonic()
                 audio_seconds += len(pcm) / 24000
                 emit("audio", pcm)
+                if audio_start is None:
+                    # A speculative first chunk can wait for turn release.
+                    # Only published audio advances the playback clock.
+                    audio_start = time.monotonic()
 
         def finish_phrase(value):
             if not mouth_enabled or not speech_ids or in_thinking or in_tool:

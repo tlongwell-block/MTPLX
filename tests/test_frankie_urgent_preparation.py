@@ -5,6 +5,7 @@ from threading import Event
 from types import SimpleNamespace as NS
 
 import pytest
+
 from mtplx.frankie.completions import Completions, Job
 
 
@@ -148,7 +149,8 @@ def test_urgent_cannot_be_attached_to_http_or_brain_jobs(kwargs):
 
 
 @pytest.mark.parametrize("mtp", [0, 2])
-def test_engine_dispatches_between_audio_chunks_below_normal_reserve(monkeypatch, mtp):
+@pytest.mark.parametrize("first_audio_hold", [0.0, 1.25])
+def test_engine_dispatches_between_audio_chunks_below_normal_reserve(monkeypatch, mtp, first_audio_hold):
     from mtplx.frankie import engine as module
 
     clock = NS(now=0.0)
@@ -214,8 +216,14 @@ def test_engine_dispatches_between_audio_chunks_below_normal_reserve(monkeypatch
 
     engine.urgent_background_step = urgent
     engine.background_step = lambda lead: normal_calls.append(lead) or False
+
+    def emit(kind, value):
+        if kind == "audio" and not any(k == "audio" for k, _ in events):
+            clock.now += first_audio_hold
+        events.append((kind, value))
+
     result = engine.respond([], {"output_modalities": ["audio"], "max_output_tokens": 4,
-                                 "thinking": "off"}, lambda *event: events.append(event),
+                                 "thinking": "off"}, emit,
                             Event(), session_id="urgent-fixture")
     assert urgent_calls == [(.16, 1)] and normal_calls == []
     assert result["text"] == "Hello. Welcome." and result["audio_seconds"] == .64

@@ -637,3 +637,87 @@ def test_realtime_invalid_image_does_not_enter_history():
                 }})
             assert not s.items
     asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_speculative_speech_prepares_audio_without_publishing_before_commit(commit):
+    from threading import Event
+
+    async def check(s):
+        prepared, finished = Event(), Event()
+        run = Response(settings=s.settings)
+        def worker():
+            s.emit(run, "text", "Hello.")
+            prepared.set()
+            s.emit(run, "audio", np.zeros(24, np.float32))
+            finished.set()
+        future = s.loop.run_in_executor(s.executor, worker)
+        assert await asyncio.to_thread(prepared.wait, 2)
+        await asyncio.sleep(.01)
+        assert run.preview_text == ["Hello."]
+        assert not finished.is_set() and not drain(s)
+        if commit:
+            s.show(run)
+        else:
+            run.abort.set()
+        await future
+        await asyncio.sleep(0)
+        events = drain(s)
+        if commit:
+            types = [e["type"] for e in events]
+            assert types.index("response.created") < types.index("response.output_audio_transcript.delta")
+            assert types.index("response.output_audio_transcript.delta") < types.index("response.output_audio.delta")
+            assert run.text == "Hello." and not run.preview_text
+        else:
+            assert not events and run.text == ""
+    asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("audio", [False, True])
+def test_speculative_text_staging_is_bounded_and_text_only_stays_gated(audio):
+    from threading import Event
+
+    async def check(s):
+        run = Response(settings={**s.settings, "output_modalities": ["audio" if audio else "text"]})
+        entered, finished = Event(), Event()
+        def worker():
+            if audio:
+                s.emit(run, "text", "x" * 4096)
+            entered.set()
+            s.emit(run, "text", "overflow")
+            finished.set()
+        future = s.loop.run_in_executor(s.executor, worker)
+        assert await asyncio.to_thread(entered.wait, 2)
+        await asyncio.sleep(.01)
+        assert not finished.is_set() and not drain(s)
+        assert sum(map(len, run.preview_text)) == (4096 if audio else 0)
+        run.abort.set()
+        await future
+        await asyncio.sleep(0)
+        assert not drain(s)
+    asyncio.run(setup(check))
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_speculative_acknowledgment_cannot_execute_a_tool_before_commit(commit):
+    async def check(s):
+        s.settings["background_tasks"] = True
+        run = Response(settings=s.settings)
+        s.current = run
+        call = {"id":"candidate", "type":"function", "function":{"name":"echo","arguments":"{}"}}
+        await s.loop.run_in_executor(s.executor, lambda: (
+            s.emit(run,"text","Let me check."),
+            s.emit(run,"tool_call",{"key":(1,0),"call":call})))
+        await asyncio.sleep(0)
+        assert run.preview_text and run.tool_candidates
+        assert not run.tool_items and not s.items and not drain(s)
+        if commit:
+            s.show(run)
+            kinds=[e["type"] for e in drain(s)]
+            assert kinds.index("response.output_audio_transcript.delta") < kinds.index("response.function_call_arguments.done")
+            assert len(run.tool_items)==1
+        else:
+            run.abort.set()
+            s.show(run)
+            assert not run.tool_items and not drain(s)
+    asyncio.run(setup(check))
