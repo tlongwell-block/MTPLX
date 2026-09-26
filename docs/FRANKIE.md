@@ -141,17 +141,6 @@ resident, the longest retained history used 86.5 MB and increased overall peak
 active memory by about 9.9 MB versus independent chunks. These are measurements
 of that workload, not a bound on total server memory.
 
-For brain history, `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=1` enables optional idle
-prefix preparation using the existing session cache. After a client confirms
-playback has finished, completed replies of at least 24 words can be prepared
-before the next user turn. This moves history processing off the next turn's
-critical path without removing that work or changing model weights, sampling,
-or mouth settings.
-The optimization is off by default, requires `frankie.playback.finished`, and
-skips background-task mode and pending input/HTTP work. New input, settings or
-requests cancel unfinished work at bounded prefill chunks. Tiny replies use the
-ordinary path without an extra pass. No new model weights or cache bank are added.
-
 For a brain finetune, change `brain_source` and run Forge again with that
 checkpoint's MTP head. The currently trained Frankie adapters expect the
 compatible 27B architecture and layer-16 features. A different architecture or
@@ -162,6 +151,7 @@ not establish compatibility.
 
 ```sh
 export MTPLX_FRANKIE_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+export MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=1
 mtplx frankie \
   --brain '/absolute/path/to/Frankie-brain-q4-mtp' \
   --audio "$PWD/models/Frankie-audio-q8" \
@@ -212,6 +202,30 @@ Open the localhost page on the client machine. Browsers permit microphone access
 on localhost or HTTPS. Treat the launch token as private. `/health` reports the
 server PID and MTP depth. Only one active Realtime conversation is accepted;
 HTTP completion requests can run alongside it.
+
+### Prepare history between turns
+
+The launch example enables `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=1`. After a client
+confirms playback has finished, completed replies of at least 24 words can be
+prepared in the existing session cache before the next user turn. This moves
+history processing off the next turn's critical path without changing model
+weights, sampling, or mouth settings.
+
+This requires `frankie.playback.finished` and skips background-task mode and
+pending input or HTTP work. New input, settings, or requests cancel unfinished
+work at bounded prefill chunks. Tiny replies use the ordinary path without an
+extra pass. Clients without playback feedback keep their existing behavior.
+
+A paired test with an official Q8 27B brain, Breeze, and MTP 2 measured
+median speech-end-to-first-received-audio latency of 785 to 615 ms at short context and 906 to 720 ms at 13k–14k tokens.
+All six paired follow-up texts and PCM outputs matched exactly. These are small
+controlled workloads, not latency guarantees or physical speaker measurements.
+
+Preparation uses extra idle compute and can retain more cache memory: paired
+active-memory differences ranged from about 25 MB to 1.4 GB in those tests.
+The existing session cache limits still apply; no additional model is loaded.
+The server default remains off. Set `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=0` or
+omit the export to keep it off when memory or idle compute is constrained.
 
 ## Duplex and agent harnesses
 
