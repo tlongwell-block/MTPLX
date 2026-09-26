@@ -255,6 +255,52 @@ def test_interleaved_branches_and_cancelled_suffix_keep_banked_prefix_immutable(
     assert warm.tokens == cold.tokens
 
 
+@pytest.mark.parametrize("store_on_prefill", [False, True])
+def test_cancellation_during_prompt_snapshot_keeps_resumption_warm(monkeypatch, store_on_prefill):
+    from mtplx import session_bank as bank_module
+
+    runtime = _runtime(CachedMTPModel())
+    cache = bank()
+    prefix = [3, 1, 4] * 30
+    generate(runtime, prefix, cache)
+    previous = cache.longest_prefix(prefix)
+    cancelled = Event()
+    monkeypatch.setenv("MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX", "1")
+    snapshot = bank_module.snapshot_cache_lazy_hybrid
+
+    def finish_and_cancel(*args, **kwargs):
+        result = snapshot(*args, **kwargs)
+        cancelled.set()
+        return result
+
+    monkeypatch.setattr(bank_module, "_lazy_snapshot_enabled", lambda: True)
+    monkeypatch.setattr(bank_module, "snapshot_cache_lazy_hybrid", finish_and_cancel)
+    ids = prefix + [2] * 12
+    if store_on_prefill:
+        state = g.restore_or_prefill_prompt_state(
+            runtime, ids, mtp_history_policy="committed", session_bank=cache,
+            session_id="prepare", store_prefix_snapshot=True,
+            abort_check=cancelled.is_set,
+        )
+        assert state.prefill_store_snapshot["stored"] is False
+    else:
+        state, _ = drain(prepare(runtime, ids, cache))
+        g.generate_mtpk(runtime, ids, _prompt_state=state, session_bank=cache,
+            session_id="prepare", commit_prompt_state_to_bank=True,
+            mtp_history_policy="committed", speculative_depth=2, max_tokens=0,
+            sampler=SamplerConfig(temperature=0), abort_check=cancelled.is_set)
+    assert cancelled.is_set()
+    assert cache.longest_prefix(prefix) is previous
+    monkeypatch.setattr(bank_module, "snapshot_cache_lazy_hybrid", snapshot)
+    # The user resumes with different audio/tokens. The old completed history
+    # remains a valid exact prefix; an abandoned extension would force a miss.
+    resumed = prefix + [6] * 16
+    warm, state = generate(runtime, resumed, cache)
+    cold, _ = generate(runtime, resumed, None)
+    assert state.cached_tokens == len(prefix)
+    assert warm.tokens == cold.tokens
+
+
 def test_image_digest_and_rope_context_survive_cooperative_cache_restore():
     from mtplx.attention_context import vision_rope_state
     from mtplx.vision.splice import VisionSplice

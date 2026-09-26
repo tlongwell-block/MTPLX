@@ -4632,6 +4632,7 @@ def restore_or_prefill_prompt_state(
                 mtp_snapshot_epoch=len(prompt_ids) if mtp_snapshot is not None else None,
                 gdn_boundaries=list(getattr(state, "gdn_boundaries", None) or []),
                 timing_out=put_timing,
+                abort_check=abort_check,
             )
             put_done = time.perf_counter()
             state.prefill_store_snapshot = _prefill_store_result(
@@ -8640,6 +8641,7 @@ def generate_mtpk(
                     getattr(prompt_state, "gdn_boundaries", None) or []
                 ),
                 timing_out=commit_put_timing,
+                abort_check=abort_check,
             )
             put_done = time.perf_counter()
             prompt_prefix_bank_commit = {

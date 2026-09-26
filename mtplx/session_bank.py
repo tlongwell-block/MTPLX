@@ -734,6 +734,7 @@ class SessionBank:
         extra_state: dict[str, Any] | None = None,
         gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
         timing_out: dict[str, Any] | None = None,
+        abort_check: Callable[[], bool] | None = None,
     ) -> SessionBankEntry | None:
         # timing_out: optional request-local dict the CALLER owns (never
         # shared bank state — puts run concurrently across the foreground,
@@ -748,6 +749,8 @@ class SessionBank:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
+        if abort_check is not None and abort_check():
+            return None
         self.last_put_nbytes = 0
         self.last_put_skipped_oversized_snapshot = False
         self._touch_session(session_id)
@@ -837,6 +840,8 @@ class SessionBank:
                 has_recurrent=cache_has_recurrent,
                 gdn_boundaries=list(normalized_boundaries),
             )
+            if abort_check is not None and abort_check():
+                return None
             self.eviction_log.append(
                 {
                     "reason": reason,
@@ -1004,9 +1009,15 @@ class SessionBank:
         )
         if timing_out is not None:
             timing_out["entry_build_s"] = time.perf_counter() - trunk_snapshot_done
+        # Snapshot evaluation can outlive a speculative request. Do not let an
+        # abandoned audio prefix supersede the reusable conversation history.
+        if abort_check is not None and abort_check():
+            return None
         if lazy_kv:
             self._schedule_snapshot_settle(entry, timing_out=timing_out)
         self._enqueue_cold_entry(entry, timing_out=timing_out)
+        if abort_check is not None and abort_check():
+            return None
         self._entries[tokens] = entry
         self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
