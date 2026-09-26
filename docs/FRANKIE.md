@@ -205,6 +205,20 @@ HTTP completion requests can run alongside it.
 
 ### Prepare history between turns
 
+The Realtime prefix cache defaults to 8 GiB total and 8 GiB per conversation.
+Snapshots that exceed these limits are not retained, so sufficiently long
+conversations can require repeated prefill. On a machine with enough free memory,
+set both limits before starting the server, for example:
+
+```sh
+export MTPLX_SESSION_BANK_MAX_BYTES=16G
+export MTPLX_SESSION_BANK_PER_SESSION_BYTES=16G
+```
+
+These are cache admission limits, not preallocated memory or context-token limits.
+Larger retained KV snapshots use additional memory. The per-conversation limit
+is capped by the total limit; unset variables retain the existing 8 GiB defaults.
+
 The launch example enables `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=1`. After a client
 confirms playback has finished, completed replies of at least 24 words can be
 prepared in the existing session cache before the next user turn. This moves

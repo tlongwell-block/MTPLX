@@ -15,6 +15,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from mtplx.engine_session import _bank_bytes_from_env
 from mtplx.features import CommittedFeatures
 from mtplx.generation import generate_ar, generate_mtpk
 from mtplx.runtime import load
@@ -43,8 +44,13 @@ class Frankie:
             (Path(brain) / "preprocessor_config.json").read_text()
         )
         self.mtp = mtp
+        cache_bytes = _bank_bytes_from_env("MTPLX_SESSION_BANK_MAX_BYTES", 8 * 1024**3)
+        session_bytes = _bank_bytes_from_env(
+            "MTPLX_SESSION_BANK_PER_SESSION_BYTES", 8 * 1024**3
+        )
         self.bank = SessionBank(
-            max_entries=6, max_bytes=8 * 1024**3, per_session_max_bytes=8 * 1024**3
+            max_entries=6, max_bytes=cache_bytes,
+            per_session_max_bytes=min(cache_bytes, session_bytes),
         )
         print("Powered by MTPLX — https://github.com/youssofal/MTPLX", flush=True)
 
