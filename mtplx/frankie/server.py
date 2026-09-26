@@ -2,10 +2,10 @@
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 import hmac
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 
@@ -19,6 +19,7 @@ def add_arguments(parser):
     parser.add_argument("--http-ctx-size", type=int, default=4096)
     parser.add_argument("--voice", type=Path)
     parser.add_argument("--voice-transcript")
+    parser.add_argument("--mlx-cache-limit", help="Freed-buffer cache limit, e.g. 8G; off uses MLX defaults.")
     return parser
 
 
@@ -35,7 +36,8 @@ def serve(args):
     os.environ["MTPLX_COMPILE_AR_FORWARD"] = "0"
     import uvicorn
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import HTMLResponse, FileResponse
+    from fastapi.responses import FileResponse, HTMLResponse
+
     from .engine import Frankie
     from .session import Session
 
@@ -51,7 +53,10 @@ def serve(args):
         def load():
             import mlx.core as mx
 
+            from mtplx.server.openai import _configure_mlx_cache_limit
+
             mx.set_default_device(mx.gpu)
+            _configure_mlx_cache_limit(args)
             model = Frankie(args.brain, args.audio, mtp=args.mtp)
             if args.voice:
                 model.audio.voice_from_wav(

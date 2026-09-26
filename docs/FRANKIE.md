@@ -203,6 +203,14 @@ on localhost or HTTPS. Treat the launch token as private. `/health` reports the
 server PID and MTP depth. Only one active Realtime conversation is accepted;
 HTTP completion requests can run alongside it.
 
+### Bound allocator retention
+
+The server uses MTPLX's existing RAM-tiered MLX allocator cache limits: 2–8 GiB
+of reusable freed buffers, depending on total system RAM. Override this with
+`--mlx-cache-limit 8G` or `MTPLX_MLX_CACHE_LIMIT=8G`; `off` retains MLX's own default.
+This does not cap active model or KV memory, change numerical precision, or
+reduce the context limit. It bounds freed buffers retained for later reuse.
+
 ### Prepare history between turns
 
 The Realtime prefix cache defaults to 8 GiB total and 8 GiB per conversation.
