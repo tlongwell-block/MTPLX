@@ -8,6 +8,7 @@ import re
 import time
 from collections import deque
 from contextlib import nullcontext
+from functools import cached_property
 from itertools import repeat
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from mtplx.vision.splice import VisionSplice
 from .audio import AudioModels
 from .detokenizing import new_detokenizer
 from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
+from .prompt_encoding import PromptEncoder
 from .sampling import brain_sampler, thinking_guard
 from .thinking import public_tool_calls
 
@@ -58,7 +60,12 @@ class Frankie:
 
     def release(self, session_id):
         self.bank.clear(session_id=session_id)
+        self.prompt_encoder.clear()
         self.audio.set_voice(self.audio._default_voice)
+
+    @cached_property
+    def prompt_encoder(self):
+        return PromptEncoder(self.tokenizer)
 
     def prepare_audio(self, item):
         transcripts = []
@@ -182,12 +189,12 @@ class Frankie:
         ids, all_rows, digests, counts = [], [], [], []
         for marker, rows, digest in media:
             before, prompt = prompt.split(marker, 1)
-            ids.extend(self.tokenizer.encode(before, add_special_tokens=False))
+            ids.extend(self.prompt_encoder(before))
             ids.extend([pad] * len(rows))
             all_rows.append(rows)
             counts.append(len(rows))
             digests.append(digest)
-        ids.extend(self.tokenizer.encode(prompt, add_special_tokens=False))
+        ids.extend(self.prompt_encoder(prompt))
         splice = (
             VisionSplice(
                 pad,
