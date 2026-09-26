@@ -300,10 +300,9 @@ class CacheMissReason(str, Enum):
 
 
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
-    h = hashlib.sha256()
-    for token in token_ids:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-    return h.hexdigest()
+    # Preserve existing cache keys, including signed media-token identities.
+    tokens = np.fromiter(map(int, token_ids), dtype="<i8")
+    return hashlib.sha256(tokens).hexdigest()
 
 
 def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
