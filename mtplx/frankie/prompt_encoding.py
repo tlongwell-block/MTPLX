@@ -6,7 +6,7 @@ from sys import getsizeof
 
 
 class PromptEncoder:
-    def __init__(self, tokenizer, *, max_bytes=4 * 1024**2, max_entries=64):
+    def __init__(self, tokenizer, *, max_bytes=4 * 1024**2, max_entries=1024):
         self.tokenizer = tokenizer
         self.max_bytes = max_bytes
         self.max_entries = max_entries

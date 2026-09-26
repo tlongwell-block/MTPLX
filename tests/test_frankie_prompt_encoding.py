@@ -64,3 +64,17 @@ def test_encoders_do_not_share_tokenizer_or_private_text():
     assert list(second("ab")) == [4321]
     second.clear()
     assert list(first("ab")) == [1000] and len(first_calls) == 1
+
+
+def test_long_audio_history_scan_keeps_the_expensive_initial_segment():
+    encode, calls = encoder()
+    # Each native audio span separates another rendered text segment. A small
+    # entry-count cap would evict every segment during each sequential scan.
+    segments = ["Reference notes. " * 4000] + [
+        f"Assistant answer before audio turn {i}." for i in range(256)
+    ]
+    expected = [list(encode(text)) for text in segments]
+    for _ in range(3):
+        assert [list(encode(text)) for text in segments] == expected
+    assert calls == segments
+    assert encode.nbytes <= encode.max_bytes
