@@ -310,7 +310,7 @@ def test_near_prefix_lane_one_forwards_stable_prefix_len(monkeypatch):
         captured.update(kwargs)
         raise _NearPrefixProbe()
 
-    monkeypatch.setattr(generation, "_restore_near_prefix_prompt_state", _recorder)
+    monkeypatch.setattr(generation._restore_near_prefix_prompt_state, "steps", _recorder)
 
     bank = SessionBank(max_entries=4, max_bytes=4096, per_session_max_bytes=4096)
     runtime = SimpleNamespace(
