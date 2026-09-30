@@ -188,6 +188,9 @@ class ModelWorkScheduler:
         self._last_quiet_anchor_s = time.monotonic()
         # Idle keepalive (GPU residency): see arm_idle_keepalive.
         self._keepalive_fn: Callable[[], Any] | None = None
+        self._keepalive_on_failure: Callable[[], Any] | None = None
+        self._keepalive_generation = 0
+        self._keepalive_failure_callback_error: str | None = None
         self._keepalive_interval_s = 0.0
         self._keepalive_attentive_s = 0.0
         self._keepalive_attentive_anchor_s = 0.0
@@ -294,6 +297,7 @@ class ModelWorkScheduler:
         *,
         interval_s: float,
         attentive_s: float,
+        on_failure: Callable[[], Any] | None = None,
     ) -> None:
         """Run ``fn`` on the owner thread whenever it has been idle for
         ``interval_s``, for ``attentive_s`` after the last foreground
@@ -314,9 +318,18 @@ class ModelWorkScheduler:
         wins immediately (the beat itself is sub-millisecond). Outside the
         attentive window the loop parks untimed as before — a daemon nobody
         is talking to costs no wakeups.
+
+        Optional ``on_failure`` runs once on this owner after three consecutive
+        beat errors disable this arm. It does not run on ordinary disarm,
+        attentive expiry or shutdown. The bounded callback holds the reentrant
+        condition lock to serialize recovery with rearming; it must not wait
+        on queued owner work or another thread.
         """
         with self._condition:
             self._keepalive_fn = fn
+            self._keepalive_on_failure = on_failure
+            self._keepalive_generation += 1
+            self._keepalive_failure_callback_error = None
             self._keepalive_interval_s = max(0.05, float(interval_s))
             self._keepalive_attentive_s = max(0.0, float(attentive_s))
             now = time.monotonic()
@@ -328,6 +341,8 @@ class ModelWorkScheduler:
     def disarm_idle_keepalive(self) -> None:
         with self._condition:
             self._keepalive_fn = None
+            self._keepalive_on_failure = None
+            self._keepalive_generation += 1
             self._condition.notify_all()
 
     def keepalive_state(self) -> dict[str, Any]:
@@ -358,6 +373,7 @@ class ModelWorkScheduler:
             "beats": self._keepalive_beats,
             "errors": self._keepalive_errors,
             "last_error": self._keepalive_last_error,
+            "failure_callback_error": self._keepalive_failure_callback_error,
             "last_beat_age_s": (
                 max(0.0, now - self._keepalive_last_beat_s)
                 if self._keepalive_last_beat_s is not None
@@ -379,7 +395,9 @@ class ModelWorkScheduler:
         return self._last_owner_activity_s + self._keepalive_interval_s
 
     def _run_keepalive(self) -> None:
-        fn = self._keepalive_fn
+        with self._condition:
+            fn = self._keepalive_fn
+            generation = self._keepalive_generation
         if fn is None:
             return
         started = time.monotonic()
@@ -389,21 +407,31 @@ class ModelWorkScheduler:
         except BaseException as exc:  # never let a beat take the owner thread down
             error = f"{type(exc).__name__}: {exc}"
         finished = time.monotonic()
+        on_failure = None
         with self._condition:
             self._last_owner_activity_s = finished
             self._keepalive_last_beat_s = finished
             self._keepalive_last_duration_s = finished - started
             if error is None:
                 self._keepalive_beats += 1
-                self._keepalive_consecutive_errors = 0
+                if generation == self._keepalive_generation:
+                    self._keepalive_consecutive_errors = 0
             else:
                 self._keepalive_errors += 1
-                self._keepalive_consecutive_errors += 1
                 self._keepalive_last_error = error
-                if self._keepalive_consecutive_errors >= 3:
-                    # A beat that keeps failing is not keeping anything
-                    # warm; stop paying for it rather than loop on errors.
-                    self._keepalive_fn = None
+                if generation == self._keepalive_generation:
+                    self._keepalive_consecutive_errors += 1
+                    if self._keepalive_consecutive_errors >= 3:
+                        # A beat that keeps failing is not keeping anything
+                        # warm; stop paying for it rather than loop on errors.
+                        self._keepalive_fn = None
+                        on_failure, self._keepalive_on_failure = self._keepalive_on_failure, None
+            if on_failure is not None:
+                try:
+                    on_failure()
+                except BaseException as exc:
+                    # Recovery must not kill the owner or strand its futures.
+                    self._keepalive_failure_callback_error = f"{type(exc).__name__}: {exc}"
 
     def stats(self) -> dict[str, Any]:
         with self._condition:

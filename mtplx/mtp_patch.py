@@ -833,11 +833,15 @@ def inject_mtp_support(
             if cache is None:
                 cache = [None] * len(inner.layers)
 
+            features = getattr(self, "_mtplx_feature_stream", None)
+            feature_offset = features.offset(cache) if features is not None else 0
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-            for layer, layer_cache in zip(inner.layers, cache):
+            for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+                if features is not None and layer_index == features.layer:
+                    features.record(inputs, hidden_states, cache, feature_offset)
 
             pre_norm = hidden_states
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")

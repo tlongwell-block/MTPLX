@@ -71,6 +71,15 @@ Issues = "https://github.com/youssofal/mtplx/issues"
 Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 
 [project.optional-dependencies]
+frankie = [
+  "mlx-audio==0.5.1",
+  "parakeet-mlx==0.5.2",
+  "soundfile>=0.14",
+  "scipy>=1.13",
+  "num2words>=0.5",
+  "websockets>=14",
+  "gguf>=0.18",
+]
 competitors = [
   "dflash-mlx==0.1.0",
 ]
@@ -95,6 +104,7 @@ include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
 mtplx = ["templates/**/*.jinja", "data/*.npy"]
+"mtplx.frankie" = ["*.html", "*.mjs", "LICENSE-Buzz", "LICENSE-MaAI", "NOTICE"]
 "mtplx.benchmarks" = ["prompts/*.jsonl"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [

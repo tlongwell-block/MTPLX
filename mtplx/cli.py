@@ -2199,6 +2199,11 @@ def build_parser() -> argparse.ArgumentParser:
         version=_version_string(),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    from .frankie.server import add_arguments, serve
+    frankie_p = add_arguments(
+        sub.add_parser("frankie", help="Serve full-duplex Frankie in one process")
+    )
+    frankie_p.set_defaults(func=serve)
     default_model = DEFAULT_HF_MODEL_ID
 
     help_p = sub.add_parser("help", help=argparse.SUPPRESS)

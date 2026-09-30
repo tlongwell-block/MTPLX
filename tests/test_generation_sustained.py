@@ -672,6 +672,24 @@ def test_generate_ar_captures_final_state_for_bank_commit():
     assert out.final_state.mtp_history_policy == "cycle"
 
 
+@pytest.mark.parametrize("limit,stops", [(1, set()), (8, {1})])
+def test_mtp_final_capture_executes_a_primary_that_ends_the_turn(limit, stops):
+    model = RejectingTinyMTPModel()
+    out = generate_mtpk(
+        _runtime(model),
+        [0, 1, 2],
+        max_tokens=limit,
+        sampler=SamplerConfig(temperature=0.0),
+        stop_token_ids=stops,
+        speculative_depth=3,
+        capture_final_state=True,
+    )
+    assert out.tokens == [1]
+    assert out.final_state.safe_to_commit is True
+    assert model.target_cache[0].offset == 4
+    assert model.calls[-1]["tokens"] == 1
+
+
 def test_default_qwen27b_ar_decode_trace_does_not_crash(tmp_path, monkeypatch):
     trace_path = tmp_path / "qwen27b-ar.jsonl"
     monkeypatch.setenv("MTPLX_DECODE_TRACE_JSONL", str(trace_path))

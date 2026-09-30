@@ -405,7 +405,7 @@ def test_both_restored_suffix_callers_hand_down_the_whole_prompt():
 
     calls = [
         block
-        for block in GENERATION_TEXT.split("_prefill_restored_prompt_suffix(")[1:]
+        for block in GENERATION_TEXT.split("_prefill_restored_prompt_suffix.steps(")[1:]
         if "cached_tokens=" in block.split("\n            )")[0]
     ]
     assert len(calls) == 2
