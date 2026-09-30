@@ -1,4 +1,5 @@
 """Text-only realtime output does not need hidden speech features."""
+from contextlib import nullcontext
 
 from threading import Event
 from types import SimpleNamespace as NS
@@ -40,7 +41,7 @@ def test_text_stream_uses_committed_tokens_without_speech_capture(monkeypatch, m
     engine.mtp = mtp
     engine.runtime = NS()
     engine.bank = None
-    engine.audio = NS(reset_speech_context=lambda: None, speak=no_features)
+    engine.audio = NS(speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: None, speak=no_features)
     engine.tokenizer = NS(
         detokenizer=Detokenizer(),
         eos_token_ids=[0],

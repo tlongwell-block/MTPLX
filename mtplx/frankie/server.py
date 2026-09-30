@@ -7,14 +7,18 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def add_arguments(parser):
+    from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES
     parser.add_argument("--brain", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18870)
     parser.add_argument("--mtp", type=int, default=3, choices=range(5))
+    parser.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    parser.add_argument("--brain-interface", choices=("neural", "text"), default="neural")
     parser.add_argument("--http-slots", type=int, default=4, choices=range(1, 9))
     parser.add_argument("--http-ctx-size", type=int, default=4096)
     parser.add_argument("--voice", type=Path)
@@ -23,25 +27,48 @@ def add_arguments(parser):
     return parser
 
 
+def configure_runtime(brain, profile, *, brain_interface="neural"):
+    from mtplx.profiles import apply_profile_env
+    overrides = None
+    if brain_interface == "text":
+        from types import SimpleNamespace
+        from mtplx.commands.public import _in_process_runtime_env_overrides
+        overrides = _in_process_runtime_env_overrides(
+            SimpleNamespace(verify_strategy="capture_commit"), str(brain), generation_mode="mtp"
+        )
+    apply_profile_env(profile, runtime_env_overrides=overrides)
+    if brain_interface == "neural":
+        os.environ["MTPLX_COMPILED_VERIFY"] = "off"
+        os.environ["MTPLX_COMPILE_AR_FORWARD"] = "0"
+
+
 def serve(args):
     if not 128 <= args.http_ctx_size <= 131072:
         raise ValueError("--http-ctx-size must be between 128 and 131072.")
     token = os.environ.get("MTPLX_FRANKIE_TOKEN")
     if not token:
         raise ValueError("Set MTPLX_FRANKIE_TOKEN to a private access token.")
-    from mtplx.profiles import apply_profile_env
-
-    apply_profile_env("sustained")
-    os.environ["MTPLX_COMPILED_VERIFY"] = "off"
-    os.environ["MTPLX_COMPILE_AR_FORWARD"] = "0"
+    configure_runtime(args.brain, args.profile, brain_interface=args.brain_interface)
     import uvicorn
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, HTMLResponse
 
     from .engine import Frankie
     from .session import Session
+    from mtplx.server.openai import _gpu_keepalive_enabled
 
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="frankie-models")
+    # Opt-in until live parity and paced voice testing qualify residency.
+    residency_enabled = _gpu_keepalive_enabled() and os.environ.get("MTPLX_FRANKIE_GPU_RESIDENCY", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if residency_enabled:
+        from mtplx.model_scheduler import ModelWorkScheduler
+        executor = ModelWorkScheduler(name="frankie-models")
+    else:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="frankie-models")
+    residency = SimpleNamespace(model_scheduler=executor, metal_memory_caps={},
+                                gpu_keepalive={}, previous_limits={}, failure=None)
+    residency_started = False
     owner = None
     engine = None
 
@@ -57,7 +84,7 @@ def serve(args):
 
             mx.set_default_device(mx.gpu)
             _configure_mlx_cache_limit(args)
-            model = Frankie(args.brain, args.audio, mtp=args.mtp)
+            model = Frankie(args.brain, args.audio, mtp=args.mtp, brain_interface=args.brain_interface)
             if args.voice:
                 model.audio.voice_from_wav(
                     args.voice.read_bytes(), args.voice_transcript
@@ -87,31 +114,93 @@ def serve(args):
                 session_id="warmup",
             )
             model.bank.clear()
+            if residency_enabled:
+                from mtplx.server.openai import (
+                    _apply_metal_memory_caps, _detect_total_ram_bytes_for_metal_caps,
+                    _resident_floor_margin_bytes,
+                )
+                ram, _ = _detect_total_ram_bytes_for_metal_caps()
+                residency.metal_memory_caps = _apply_metal_memory_caps(
+                    total_ram_bytes=ram,
+                    minimum_resident_bytes=(mx.get_active_memory()
+                                            + _resident_floor_margin_bytes(ram)),
+                    previous_limits=residency.previous_limits,
+                )
             return model
 
-        engine = await loop.run_in_executor(executor, load)
-        print(
-            f"Frankie ready: one process, pid={os.getpid()}, MTP={args.mtp}, http://{args.host}:{args.port}",
-            flush=True,
-        )
-        yield
-        if owner is not None:
-            await owner.close()
-        executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            engine = await loop.run_in_executor(executor, load)
+            print(
+                f"Frankie ready: one process, pid={os.getpid()}, MTP={args.mtp}, http://{args.host}:{args.port}",
+                flush=True,
+            )
+            yield
+        finally:
+            try:
+                if owner is not None:
+                    await owner.close()
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+    def residency_fallback(receipt):
+        """Restore this feature's wiring on the model owner, preserving old caps."""
+        from mtplx.server.openai import _set_metal_memory_limit
+        executor.disarm_idle_keepalive()
+        receipt["enabled"] = False
+        caps = residency.metal_memory_caps
+        if caps.get("wired_limit_api"):
+            try:
+                import mlx.core as mx
+                previous = residency.previous_limits["set_wired_limit"]
+                _set_metal_memory_limit(mx, "set_wired_limit", previous)
+                caps["wired_limit_bytes"] = previous
+                receipt["restored_wired_limit_bytes"] = previous
+            except Exception as exc:
+                residency.failure = f"residency_restore_failed:{type(exc).__name__}"
+                receipt["reason"] = residency.failure
+                executor.shutdown(wait=False, cancel_futures=True)
+        residency.gpu_keepalive = receipt
+
+    def residency_failed():
+        residency_fallback({"reason": "keepalive_runtime_failure"})
+
+    def get_engine():
+        nonlocal residency_started
+        # Called by get_service only after authenticated HTTP/voice admission.
+        # Arming and its tiny MLX allocation run on the same model owner.
+        if residency_enabled and not residency_started:
+            residency_started = True
+            def arm():
+                from mtplx.server.openai import _arm_gpu_keepalive
+                try:
+                    receipt = _arm_gpu_keepalive(residency, on_failure=residency_failed)
+                except Exception as exc:
+                    receipt = {"enabled": False, "reason": f"arm_failed:{type(exc).__name__}"}
+                if receipt["enabled"]:
+                    residency.gpu_keepalive = receipt
+                else:
+                    residency_fallback(receipt)
+            executor.submit(arm)
+        return engine
 
     app = FastAPI(lifespan=lifespan)
     from .completions import attach_routes
-    completion_service = attach_routes(app, lambda: engine, executor, token,
+    completion_service = attach_routes(app, get_engine, executor, token,
                                        slots=args.http_slots, context_tokens=args.http_ctx_size)
 
     @app.get("/health")
     async def health():
+        from mtplx.server.openai import _gpu_keepalive_health
         return {
-            "status": "ready" if engine else "loading",
+            "status": "failed" if residency.failure else "ready" if engine else "loading",
             "model": "Frankie",
             "pid": os.getpid(),
             "mtp": args.mtp,
+            "brain_interface": args.brain_interface,
+            "profile": args.profile,
             "single_process": True,
+            "gpu_keepalive": _gpu_keepalive_health(residency),
+            "metal_memory_caps": residency.metal_memory_caps,
         }
 
     @app.get("/", response_class=HTMLResponse)

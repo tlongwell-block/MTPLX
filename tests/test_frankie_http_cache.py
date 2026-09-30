@@ -180,7 +180,7 @@ def test_http_iterator_uses_shared_bank_once_and_reports_hits(monkeypatch):
     runtime = _runtime(CachedMTPModel())
     cache = bank()
     service = Completions.__new__(Completions)
-    service.engine = NS(runtime=runtime, bank=cache, mtp=2,
+    service.engine = NS(runtime=runtime, bank=cache, mtp=2, verify_strategy="capture_commit",
                         tokenizer=NS(eos_token_ids=set()))
     service.emit_text = lambda *args: None
 

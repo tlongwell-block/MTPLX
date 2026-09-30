@@ -1,4 +1,5 @@
 """Independent native-token admission checks with real feature commitment on CPU."""
+from contextlib import nullcontext
 
 import json
 from threading import Event
@@ -42,7 +43,7 @@ def engine_run(monkeypatch, pieces, *, mtp=2, audio=True, background=True,
         def finalize(self):
             self.last_segment = ""
 
-    def speak(text, states):
+    def speak(text, states, *, response_owner=None):
         spoken.append(text)
         yield mx.zeros((960,))
 
@@ -77,7 +78,7 @@ def engine_run(monkeypatch, pieces, *, mtp=2, audio=True, background=True,
     engine = module.Frankie.__new__(module.Frankie)
     engine.mtp, engine.bank = mtp, None
     engine.runtime = NS(model=NS(model=NS(layers=[None]*20)))
-    engine.audio = NS(reset_speech_context=lambda: None, speak=speak)
+    engine.audio = NS(speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: None, speak=speak)
     engine.tokenizer = NS(detokenizer=Detokenizer(), eos_token_ids=[0],
                           decode=lambda tokens: "".join(values[token] for token in tokens))
     engine.prompt = lambda *args, **kwargs: ([1], None)

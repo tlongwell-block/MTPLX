@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
 
 import pytest
@@ -79,6 +80,25 @@ def test_cancelled_queued_response_does_not_prepare_audio():
         engine.respond([], {}, lambda *a: None, abort, session_id="cancelled")
 
 
+@pytest.mark.parametrize("modalities", [["audio"], ["text"]])
+def test_cancelled_response_never_claims_codec_or_enters_owned_body(modalities):
+    from threading import Event
+
+    from mtplx.frankie.engine import Frankie
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A pre-cancelled response must not touch response state")
+
+    engine = Frankie.__new__(Frankie)
+    engine.audio = NS(speech_response=forbidden)
+    engine._respond = forbidden
+    abort = Event()
+    abort.set()
+    with pytest.raises(InterruptedError, match="cancelled"):
+        engine.respond([], {"output_modalities": modalities}, forbidden, abort,
+                       session_id="cancelled-before-codec-lease")
+
+
 @pytest.mark.parametrize("temperature", [0, 0.9])
 @pytest.mark.parametrize("top_p", [0.8, 1.0])
 @pytest.mark.parametrize("top_k", [0, 20, 50])
@@ -154,11 +174,17 @@ def breeze_context(monkeypatch):
     from mtplx.frankie.breeze import BreezeModel, Model
 
     model = BreezeModel.__new__(BreezeModel)
+    model.context_mode = "reset"
+    model.context_bytes = 100_000_000
     model.context_rows = 2048
     model.context_words = 100
     model._voice_prefix = mx.zeros((200, 4))
     model.backbone_model = NS(embed_tokens=lambda ids: mx.zeros((1, 1, 4)))
-    model._new_cache = lambda: [NS(offset=0, keys=NS(nbytes=1), values=NS(nbytes=1))]
+    class Cache(NS):
+        def size(self):
+            return self.offset
+
+    model._new_cache = lambda: [Cache(offset=0, keys=NS(nbytes=1), values=NS(nbytes=1))]
     model.config = NS(codebook_eos_token_id=0)
     model.num_codebooks = 1
     model.reset_speech_context()
@@ -203,7 +229,7 @@ def test_breeze_discards_unusable_context(breeze_context, case):
         model._voice_prefix = mx.zeros((2100, 4))
     if case == "large_cache":
         model._new_cache = lambda: [
-            NS(offset=0, keys=NS(nbytes=50_000_001), values=NS(nbytes=50_000_000))
+            NS(offset=0, size=lambda: 0, keys=NS(nbytes=50_000_001), values=NS(nbytes=50_000_000))
         ]
     if case == "disabled":
         model.context_words = 0
@@ -236,7 +262,7 @@ def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
         def add_token(self, token):
             self.last_segment = {2: "Hello.", 3: " Next"}[token]
 
-    def speak(*args):
+    def speak(*args, response_owner=None):
         try:
             yield mx.zeros((2400,))
             abort.set()
@@ -269,7 +295,7 @@ def test_cancel_during_playback_unwinds_decode_and_features(monkeypatch, mtp):
     )
     context_resets = []
     engine.audio = NS(
-        speak=speak, reset_speech_context=lambda: context_resets.append(True)
+        speak=speak, speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: context_resets.append(True)
     )
     engine.prompt = lambda *a, **kw: ([1], None)
     emitted = []

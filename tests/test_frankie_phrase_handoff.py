@@ -1,4 +1,5 @@
 """Speech may use a committed boundary before the following feature is ready."""
+from contextlib import nullcontext
 
 from threading import Event
 from types import SimpleNamespace as NS
@@ -41,7 +42,7 @@ def test_committed_boundary_keeps_exact_phrase_features(
         def finalize(self):
             self.last_segment = ""
 
-    def speak(text, states):
+    def speak(text, states, *, response_owner=None):
         spoken.append((text, states.tolist()))
         yield mx.zeros((1920,))
 
@@ -68,7 +69,7 @@ def test_committed_boundary_keeps_exact_phrase_features(
     engine.mtp = mtp
     engine.runtime = NS(model=NS(model=NS(layers=[None] * 20)))
     engine.bank = None
-    engine.audio = NS(speak=speak, reset_speech_context=lambda: None)
+    engine.audio = NS(speak=speak, speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: None)
     engine.tokenizer = NS(
         detokenizer=Detokenizer(),
         eos_token_ids=[0],

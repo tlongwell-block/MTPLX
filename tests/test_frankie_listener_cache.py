@@ -221,7 +221,7 @@ def test_divergent_listener_inputs_restore_exact_short_recurrent_prefix(monkeypa
     original_payloads = cache_payloads()
     original_bytes = private.total_nbytes
     service = Completions.__new__(Completions)
-    service.engine = NS(runtime=runtime, bank=voice_bank, mtp=2,
+    service.engine = NS(runtime=runtime, bank=voice_bank, mtp=2, verify_strategy="capture_commit",
                         tokenizer=NS(eos_token_ids=set()))
     service.emit_text = lambda *args: None
 

@@ -78,3 +78,61 @@ def test_long_audio_history_scan_keeps_the_expensive_initial_segment():
         assert [list(encode(text)) for text in segments] == expected
     assert calls == segments
     assert encode.nbytes <= encode.max_bytes
+
+
+def chat_tokenizer(*, prefix_space=False):
+    from tokenizers import AddedToken, Regex, Tokenizer, models, normalizers, pre_tokenizers, processors, trainers
+
+    backend = Tokenizer(models.BPE())
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(r"\s+|[^\s]+"), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=prefix_space, use_regex=False),
+    ])
+    backend.post_processor = processors.ByteLevel(trim_offsets=False)
+    backend.train_from_iterator(
+        ["Hello world. A café. Useful tool result. 中文"],
+        trainers.BpeTrainer(vocab_size=400, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()),
+    )
+    backend.add_special_tokens([AddedToken("<|im_end|>", special=True, normalized=False)])
+    calls = []
+
+    def encode(text, **kwargs):
+        calls.append(text)
+        return backend.encode(text, **kwargs).ids
+
+    return SimpleNamespace(backend_tokenizer=backend, encode=encode), calls
+
+
+def test_special_fence_reuses_closed_messages_with_exact_unicode_ids(monkeypatch):
+    monkeypatch.setenv("MTPLX_FRANKIE_PROMPT_SEGMENTS", "1")
+    tokenizer, calls = chat_tokenizer()
+    encode = PromptEncoder(tokenizer)
+    assert encode.boundary == "<|im_end|>"
+    previous = "user\ne\u0301 \u0344 中文🙂<|im_end|>assistant\n"
+    for text in (previous, previous + "Hello.<|im_end|>user\nNext<|im_end|>assistant\n"):
+        expected = tokenizer.backend_tokenizer.encode(text, add_special_tokens=False).ids
+        assert list(encode(text)) == expected
+    assert calls.count("user\ne\u0301 \u0344 中文🙂<|im_end|>") == 1
+    assert encode.nbytes <= encode.max_bytes
+
+
+@pytest.mark.parametrize("limits", [{"max_entries": 3}, {"max_bytes": 64}])
+def test_segment_budget_falls_back_before_partial_encoding(monkeypatch, limits):
+    monkeypatch.setenv("MTPLX_FRANKIE_PROMPT_SEGMENTS", "1")
+    tokenizer, calls = chat_tokenizer()
+    encode = PromptEncoder(tokenizer, **limits)
+    text = "Hello<|im_end|>world<|im_end|>assistant\n"
+    expected = tokenizer.backend_tokenizer.encode(text, add_special_tokens=False).ids
+    assert list(encode(text)) == expected and calls == [text]
+    assert encode.nbytes <= encode.max_bytes and len(encode.entries) <= encode.max_entries
+
+
+def test_context_sensitive_prefix_space_disables_segmentation(monkeypatch):
+    monkeypatch.setenv("MTPLX_FRANKIE_PROMPT_SEGMENTS", "1")
+    tokenizer, calls = chat_tokenizer(prefix_space=True)
+    encode = PromptEncoder(tokenizer)
+    assert encode.boundary is None
+    text = "Hello<|im_end|>world"
+    assert list(encode(text)) == tokenizer.backend_tokenizer.encode(text, add_special_tokens=False).ids
+    assert calls == [text]

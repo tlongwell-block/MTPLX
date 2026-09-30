@@ -2264,15 +2264,21 @@ def _metal_is_available(mx: Any) -> bool:
     return metal is not None
 
 
-def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
+def _set_metal_memory_limit(
+    mx: Any, name: str, value: int, *, previous_limits: dict[str, int] | None = None,
+) -> str:
     top_level = getattr(mx, name, None)
     if callable(top_level):
-        top_level(int(value))
+        previous = top_level(int(value))
+        if previous_limits is not None and isinstance(previous, int):
+            previous_limits[name] = previous
         return f"mx.{name}"
     metal = getattr(mx, "metal", None)
     metal_level = getattr(metal, name, None)
     if callable(metal_level):
-        metal_level(int(value))
+        previous = metal_level(int(value))
+        if previous_limits is not None and isinstance(previous, int):
+            previous_limits[name] = previous
         return f"mx.metal.{name}"
     raise AttributeError(f"MLX memory cap API {name} is unavailable")
 
@@ -2310,6 +2316,7 @@ def _apply_metal_memory_caps(
     mx_module: Any | None = None,
     total_ram_bytes: int | None = None,
     minimum_resident_bytes: int | None = None,
+    previous_limits: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Set MLX allocation and wired-residency budgets at startup.
 
@@ -2327,7 +2334,8 @@ def _apply_metal_memory_caps(
       MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total
                                    RAM, capped at 160 GiB on very large Macs
 
-    Both accept plain bytes or K/M/G/T suffix.
+    Both accept plain bytes or K/M/G/T suffix. When supplied, ``previous_limits``
+    collects the actual prior budgets for a caller-owned rollback.
     """
     if mx_module is None:
         try:
@@ -2413,7 +2421,7 @@ def _apply_metal_memory_caps(
     # back to the deprecated mx.metal.* names if running on an older MLX.
     try:
         applied["memory_limit_api"] = _set_metal_memory_limit(
-            mx, "set_memory_limit", int(mem_limit)
+            mx, "set_memory_limit", int(mem_limit), previous_limits=previous_limits,
         )
         applied["memory_limit_bytes"] = int(mem_limit)
         # "env": the operator set MTPLX_MEMORY_LIMIT_BYTES; the memory plan
@@ -2423,7 +2431,7 @@ def _apply_metal_memory_caps(
         applied["memory_limit_error"] = str(exc)
     try:
         applied["wired_limit_api"] = _set_metal_memory_limit(
-            mx, "set_wired_limit", int(wired_limit)
+            mx, "set_wired_limit", int(wired_limit), previous_limits=previous_limits,
         )
         applied["wired_limit_bytes"] = int(wired_limit)
     except Exception as exc:
@@ -2496,7 +2504,9 @@ def _make_gpu_residency_touch() -> Callable[[], None]:
     return touch
 
 
-def _arm_gpu_keepalive(state: "ServerState") -> dict[str, Any]:
+def _arm_gpu_keepalive(
+    state: "ServerState", *, on_failure: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
     """Decide and arm the residency keepalive; the receipt rides /health."""
     receipt: dict[str, Any] = {
         "enabled": False,
@@ -2524,6 +2534,7 @@ def _arm_gpu_keepalive(state: "ServerState") -> dict[str, Any]:
         touch,
         interval_s=receipt["interval_s"],
         attentive_s=receipt["attentive_s"],
+        **({"on_failure": on_failure} if on_failure is not None else {}),
     )
     receipt["enabled"] = True
     receipt["wired_limit_bytes"] = int(wired)

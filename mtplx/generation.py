@@ -8093,6 +8093,8 @@ def generate_mtpk(
     constraint: Any | None = None,
     adaptive_width_policy: Any | None = None,
     _prompt_state: PromptState | None = None,
+    prompt_state_callback: Callable[[PromptState], None] | None = None,
+    graphbank_callback: Callable[[object], None] | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -8674,6 +8676,8 @@ def generate_mtpk(
                 ),
             }
     cache = prompt_state.trunk_cache
+    if prompt_state_callback is not None:
+        prompt_state_callback(prompt_state)
     logits = prompt_state.logits
     hidden = prompt_state.hidden
     mtp_history_cache = prompt_state.committed_mtp_cache
@@ -8693,6 +8697,8 @@ def generate_mtpk(
         if verify_strategy in {"graphbank", "graphbank_capture_commit"}
         else None
     )
+    if graphbank is not None and graphbank_callback is not None:
+        graphbank_callback(graphbank)
     _compiled_verify_mode = compiled_verify_mode()
     generic_compiled_target_prefix = (
         target_prefix_verify
@@ -9502,6 +9508,8 @@ def generate_mtpk(
         state_rebase_events += 1
         state_rebase_tokens_since = 0
         cache = rebased.trunk_cache
+        if prompt_state_callback is not None:
+            prompt_state_callback(rebased)
         logits = rebased.logits
         hidden = rebased.hidden
         # `logits` is now a fresh full-prefill row — deliberately a DIFFERENT
@@ -9904,7 +9912,8 @@ def generate_mtpk(
         # the model's own generated text (self-repetition) tend to have weak
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
-        ccopy_index.sync(prompt_ids)
+        if max_tokens != 0:
+            ccopy_index.sync(prompt_ids)
     wants_policy_metrics = bool(
         getattr(adaptive_policy, "wants_draft_metrics", False)
     )

@@ -1,4 +1,5 @@
 """Native interleaving filters private tokens and hands public speech off early."""
+from contextlib import nullcontext
 
 from threading import Event
 from types import SimpleNamespace as NS
@@ -36,7 +37,7 @@ def run_voice(monkeypatch, pieces, *, mtp, thinking="off", termination="stop", i
         def finalize(self):
             self.last_segment = ""
 
-    def speak(text, states):
+    def speak(text, states, *, response_owner=None):
         spoken.append((text, states.tolist()))
         yield mx.zeros((960,))
 
@@ -68,7 +69,7 @@ def run_voice(monkeypatch, pieces, *, mtp, thinking="off", termination="stop", i
     engine.mtp = mtp
     engine.runtime = NS(model=NS(model=NS(layers=[None] * 20)))
     engine.bank = None
-    engine.audio = NS(speak=speak, reset_speech_context=lambda: resets.append(True))
+    engine.audio = NS(speak=speak, speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: resets.append(True))
     engine.tokenizer = NS(detokenizer=Detokenizer(), eos_token_ids=[0],
                           decode=lambda tokens: "".join(values[token] for token in tokens))
     engine.prompt = lambda *a, **kw: ([1], None)

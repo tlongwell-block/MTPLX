@@ -12,9 +12,9 @@ def make_bank(monkeypatch, tmp_path):
     monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
     monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
     monkeypatch.setattr(engine, "load", lambda *a, **k: SimpleNamespace(tokenizer=None))
-    monkeypatch.setattr(engine, "AudioModels", lambda *a: None)
+    monkeypatch.setattr(engine, "AudioModels", lambda *a, **k: None)
     monkeypatch.setattr(engine, "load_vision_tower", lambda *a: None)
-    monkeypatch.setattr(engine, "vision_spec_for_model_dir", lambda *a: None)
+    monkeypatch.setattr(engine, "vision_spec_for_model_dir", lambda *a: SimpleNamespace(model_type="qwen3_5"))
     (tmp_path / "preprocessor_config.json").write_text("{}")
     return lambda: engine.Frankie(tmp_path, tmp_path).bank
 

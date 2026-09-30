@@ -1656,7 +1656,7 @@ class SessionBank:
         entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(token_ids)
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -1711,19 +1711,17 @@ class SessionBank:
 
         # kvcache-v2 boundary-true restore: on hybrid models a sub-prefix
         # restore must land on a token where the recurrent state is *known*,
-        # not merely where the KV can trim. Restoring KV to `matched` while
-        # recurrent state stays at the stored end silently degrades answers
-        # (Desktop QA, pre-v2). Tiny gaps (<= near-prefix gap limit) keep the
-        # long-shipped tokenizer-drift tolerance; anything larger requires a
-        # stored boundary <= matched and restores there instead, with the
-        # caller re-prefilling (boundary, prompt_end].
+        # not merely where the KV can trim. Even one changed token invalidates
+        # the later recurrent state. Restore a captured boundary <= matched,
+        # or decline this candidate so the caller can prefill correctly.
         restore_point = matched
         boundary_snapshot: CacheSnapshot | None = None
         boundary_hidden: Any | None = None
         gap_from_entry = int(entry.prefix_len) - matched
         needs_boundary = (
             bool(entry.has_recurrent)
-            and gap_from_entry > _near_prefix_tiny_gap_limit()
+            and (gap_from_entry > 0 if _boundary_true_restore_enabled()
+                 else gap_from_entry > _near_prefix_tiny_gap_limit())
         )
         if needs_boundary:
             boundary = entry.recurrent_boundary_at_or_below(matched)

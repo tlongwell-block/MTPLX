@@ -131,9 +131,38 @@ reuse, or select up to `1000`. `MTPLX_FRANKIE_BREEZE_CONTEXT_ROWS` defaults to
 would be exceeded, generation starts again from the voice reference, reserving
 space for the new chunk's maximum audio length. This periodically refreshes the
 whole history instead of shifting individual KV rows. Completed caches larger
-than 100,000,000 bytes, including allocation padding, are discarded regardless
-of those settings. That limit applies to retained KV arrays, not temporary
-inference buffers or the MLX allocator's reusable pool.
+than `MTPLX_FRANKIE_SPEECH_CONTEXT_BYTES` (default `100000000`), including
+allocation padding, are discarded. The configurable range is 1–512 MB.
+That limit applies to retained KV arrays, not temporary inference buffers or
+the MLX allocator's reusable pool; it is checked after rendering a chunk.
+
+For whole-phrase sliding eviction, set
+`MTPLX_FRANKIE_SPEECH_CONTEXT_MODE=sliding` (default `reset`). It preserves the
+original voice-reference prefix and evicts the oldest complete text/audio
+chunks before rendering the next one. The word limit includes the incoming
+chunk; it is not that many words of preceding context. Retained K/V is reused
+without re-rendering, with monotonic positional indices. This bounds attention
+history but is not equivalent to recomputing it without the evicted past.
+Row and memory limits can shorten the retained window further.
+
+An optional larger window can use:
+
+```sh
+export MTPLX_FRANKIE_SPEECH_CONTEXT_MODE=sliding
+export MTPLX_FRANKIE_SPEECH_CONTEXT_WORDS=100
+export MTPLX_FRANKIE_SPEECH_CONTEXT_BYTES=192000000
+```
+
+Speech cadence can change with a larger window; compare naturalness with your
+own reference. The reference conditioning is separate from the generated-word
+budget. New replies and interruptions still reset the generated speech cache.
+
+`MTPLX_FRANKIE_CODEC_CONTEXT=convolution` additionally preserves bounded decoder
+convolution buffers between phrases in the same response. Decoder attention
+state still resets at phrase boundaries. The default is `off`; full attention
+continuation is not exposed. Response ownership prevents concurrent use or
+voice changes from borrowing another reply's decoder state, and cancellation
+and errors release it. This option does not filter or crossfade the waveform.
 
 Responses, voice changes, interruptions and incomplete generation clear the
 cache. In a controlled 100-word-context measurement with all Frankie weights
@@ -147,6 +176,14 @@ compatible 27B architecture and layer-16 features. A different architecture or
 hidden width requires new adapters and validation; changing a path alone does
 not establish compatibility.
 
+For a different supported brain, including Qwen Flash-Next, use
+`--brain-interface text` with a Breeze audio package. Parakeet's transcript feeds
+the brain, and generated text feeds Breeze, inside the same process. This path
+does not load the 27B-specific neural ear, tone or expression bridges; it is not
+a transfer of their trained capabilities. The default `neural` interface keeps
+those bridges for their matching brain. Native vision and MTP use the selected
+brain's own components. The text interface currently requires Breeze.
+
 ## Start the server and page
 
 ```sh
@@ -157,6 +194,20 @@ mtplx frankie \
   --audio "$PWD/models/Frankie-audio-q8" \
   --mtp 3 --host 127.0.0.1 --port 18870
 ```
+
+`--profile` selects the existing MTPLX runtime profile (`sustained` by default).
+For example, `--brain-interface text --profile turbo --mtp 2` selects the
+transcript-based Flash-Next path without changing the model's quantization.
+
+Two optional latency settings reuse the existing MTPLX mechanisms:
+
+- `MTPLX_FRANKIE_GPU_RESIDENCY=1` uses the shared model scheduler, memory limits
+  and attentive GPU keepalive. `MTPLX_GPU_KEEPALIVE=0` overrides it. Repeated
+  keepalive failure restores the prior wired-memory cap; health reports failure
+  if that restoration fails. No second model worker is created.
+- `MTPLX_FRANKIE_PROMPT_SEGMENTS=1` reuses exact closed-message tokenization for
+  compatible tokenizers within a 4 MiB, 4,096-entry cache. Unsupported tokenizer
+  boundaries or oversized working sets fall back to whole-string encoding.
 
 After the log reports `Frankie ready`, open
 `http://127.0.0.1:18870/#YOUR_TOKEN`, replacing `YOUR_TOKEN` with the environment
@@ -280,9 +331,12 @@ the CPU and can hold a short pause open; stale predictions cannot stall a turn,
 and 1.5 seconds of silence forces release. Older packages continue using VAD.
 
 A tool-capable harness supplies function schemas in `session.update.tools` and
-consumes function-call items in `response.done`. It executes tools through its
+consumes completed function-call items. It executes tools through its
 normal permission rules, inserts `function_call_output` items, and requests the
-next response. The model server does not execute tools. For a harness that owns
+next response. Valid tool results are acknowledged even while another response
+is generating; they enter the next response's history without changing the active
+generation's snapshot. The harness still owns scheduling the continuation after
+that response finishes. The model server does not execute tools. For a harness that owns
 turn scheduling, set `audio.input.turn_detection.create_response` to `false`;
 committed microphone turns still arrive normally. The existing Hermes
 `realtime-voice` plugin was exercised against this endpoint with its real agent

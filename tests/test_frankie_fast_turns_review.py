@@ -101,6 +101,30 @@ def test_first_recognized_non_nod_yields_without_brain_or_recheck(text):
     asyncio.run(setup(check))
 
 
+def test_recognized_interrupt_after_playback_drain_keeps_complete_user_turn():
+    async def check(s, e):
+        listener = FastListener("Actually Thursday.", held=True)
+        await fast(s, listener)
+        old = staged_reply(s)
+        await feed(s, 16000, 10)
+        await listener.entered.wait()
+        old.playback_finished = True
+        old.played_ms = int(old.emitted_ms)
+        listener.release.set()
+        await wait_for(lambda: s.prefix_task is None)
+        assert s.prefix_yielded and s.overlap_run is None and s.listening
+        assert not old.abort.is_set() and old.text == "The first point. The old plan."
+        assert clear_events(s) == []
+        await feed(s, 0, 10)
+        await wait_for(lambda: len(e.calls) == 1)
+        audio = [part["_pcm"] for item in e.calls[0] for part in item.get("content", [])
+                 if part["type"] == "input_audio"]
+        assert len(audio) == 1 and np.count_nonzero(audio[0]) == 10 * 768
+        e.releases[0].set()
+        await wait_for(lambda: s.current.done)
+    asyncio.run(setup(check))
+
+
 @pytest.mark.parametrize("misheard", ["Im.", "I hope"])
 def test_unstable_non_nod_waits_then_recognized_nod_preserves_and_stable_interrupt_yields(misheard):
     async def check(s, e):

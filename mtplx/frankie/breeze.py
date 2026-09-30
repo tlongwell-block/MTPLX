@@ -1,6 +1,8 @@
 """Frankie text-to-speech using mlx-audio's Breeze model and cached depth decoding."""
 
 import json
+from collections import deque
+from contextlib import nullcontext
 import os
 from pathlib import Path
 
@@ -42,6 +44,14 @@ class BreezeModel(Model):
             for _ in range(head.shape[0])
         ]
         self._voice_prefix = None
+        self.context_mode = os.environ.get("MTPLX_FRANKIE_SPEECH_CONTEXT_MODE", "reset")
+        if self.context_mode not in {"reset", "sliding"}:
+            raise ValueError("Speech context mode must be reset or sliding")
+        self.context_bytes = int(os.environ.get("MTPLX_FRANKIE_SPEECH_CONTEXT_BYTES", "100000000"))
+        if not 1000000 <= self.context_bytes <= 512000000:
+            raise ValueError("Speech context memory limit is out of bounds")
+        self._window_evictions = self._window_evicted_rows = 0
+        self._next_words = 0
         self.context_rows = int(
             os.environ.get("MTPLX_FRANKIE_BREEZE_CONTEXT_ROWS", "2048")
         )
@@ -61,16 +71,23 @@ class BreezeModel(Model):
         self._context_words = 0
         self._continuing = False
         self._max_frames = 0
+        self._speech_segments = deque()
+        self._chunk_start_rows = 0
 
     def _generation_cache(self):
         if not self._continuing:
             self._speech_cache = self._new_cache()
+            self._speech_segments.clear()
+            if self.context_mode == "sliding":
+                from .speech_window import SpeechWindowCache
+                self._speech_cache = [SpeechWindowCache(c) for c in self._speech_cache]
             self._context_words = 0
         return self._speech_cache
 
     def generate(self, *args, **kwargs):
         words = len((args[0] if args else kwargs["text"]).split())
-        if self._context_words + words > self.context_words:
+        self._next_words = words
+        if self.context_mode == "reset" and self._context_words + words > self.context_words:
             self.reset_speech_context()
         self._max_frames = kwargs.get("max_tokens", 750)
         complete, frames = False, 0
@@ -86,13 +103,15 @@ class BreezeModel(Model):
                 or not self.context_words
                 or words > self.context_words
                 or self._speech_cache is None
-                or self._speech_cache[0].offset > self.context_rows
+                or self._speech_cache[0].size() > self.context_rows
                 or sum(s.keys.nbytes + s.values.nbytes for s in self._speech_cache)
-                > 100_000_000
+                > self.context_bytes
             ):
                 self.reset_speech_context()
             else:
                 self._context_words += words
+                if self.context_mode == "sliding":
+                    self._speech_segments.append((words, self._speech_cache[0].size() - self._chunk_start_rows))
 
     @staticmethod
     def sanitize(weights):
@@ -110,7 +129,10 @@ class BreezeModel(Model):
         target = super()._prompt_embeddings(*args, **kwargs)
         if self._voice_prefix is None:
             raise ValueError("Breeze voice conditioning was not initialized.")
-        cached = 0 if self._speech_cache is None else self._speech_cache[0].offset
+        if self.context_mode == "sliding" and self.context_words and self.context_rows:
+            from .speech_window import slide
+            slide(self, target.shape[1] + 1 + self._max_frames)
+        cached = 0 if self._speech_cache is None else self._speech_cache[0].size()
         self._continuing = bool(
             self.context_rows
             and self.context_words
@@ -122,6 +144,7 @@ class BreezeModel(Model):
             prefix = self.backbone_model.embed_tokens(eos)
         else:
             prefix = self._voice_prefix[None].astype(target.dtype)
+        self._chunk_start_rows = cached if self._continuing else self._voice_prefix.shape[0]
         if self.context_rows:
             print(
                 f"Breeze context: cached={cached if self._continuing else 0} new={prefix.shape[1] + target.shape[1]}",
@@ -227,6 +250,11 @@ class BreezeMouth:
     def __init__(self, directory, weights):
         self.model = load_breeze(directory)
         self.weights = weights
+        mode = os.environ.get("MTPLX_FRANKIE_CODEC_CONTEXT", "off")
+        self.codec_context = None
+        if mode != "off":
+            from .codec_context import CodecContext
+            self.codec_context = CodecContext(self.model.audio_tokenizer.decoder, mode)
         self._default_voice = {
             "voice.prefix": weights["breeze.voice_prefix"],
             "voice.rms_db": weights["voice.rms_db"],
@@ -234,12 +262,16 @@ class BreezeMouth:
         self.set_voice(self._default_voice)
 
     def set_voice(self, values):
+        if self.codec_context is not None:
+            self.codec_context.require_idle()
         self.model.reset_speech_context()
         self.voice = values
         self.model._voice_prefix = values["voice.prefix"]
         self.reference_db = float(values["voice.rms_db"].item())
 
     def voice_from_pcm(self, pcm, transcript):
+        if self.codec_context is not None:
+            self.codec_context.require_idle()
         model = self.model
         prefix = model.reference_prefix(pcm, transcript)
         values = {
@@ -267,24 +299,53 @@ class BreezeMouth:
             instruction += " with a " + ("angry", "happy", "sad")[winner] + " tone"
         return instruction + "."
 
-    def speak(self, text, states, *, temperature=0.9):
+    def speak(self, text, states, *, temperature=0.9, response_owner=None):
+        if self.codec_context is not None:
+            if response_owner is None:
+                with self.codec_context.response() as owner:
+                    yield from self.speak(text, states, temperature=temperature, response_owner=owner)
+                return
+            self.codec_context.require_owner(response_owner)
         if not isinstance(text, str) or not text.strip() or len(text.encode()) > 8192:
             raise ValueError("Breeze requires bounded nonempty spoken text.")
         model = self.model
         token_count = len(model._text_ids(text))
         if token_count > 512:
             raise ValueError("Breeze spoken span exceeds 512 tokens.")
+        # An immediate EOS is not a spoken phrase. Retry once from the
+        # reference before emitting anything, rather than publish dummy silence.
+        max_frames = min(384, max(75, token_count * 12))
+        for attempt in range(2):
+            scope = (self.codec_context.phrase(response_owner)
+                     if self.codec_context is not None else nullcontext())
+            with scope:
+                empty = yield from self._speak_attempt(text, states, temperature, max_frames, response_owner)
+            if not empty:
+                return
+            model.reset_speech_context()
+        raise RuntimeError("Breeze produced no speech after a retry.")
+
+    def _speak_attempt(self, text, states, temperature, max_frames, response_owner):
+        model = self.model
         generator = model.generate(
             text,
             instruct=self.instruction(states),
             stream=True,
             streaming_interval=0.08,
             temperature=temperature,
-            max_tokens=min(384, max(75, token_count * 12)),
+            max_tokens=max_frames,
         )
         gain, energy, samples = 1.0, 0.0, 0
+        empty = False
+        frames = 0
         try:
             for result in generator:
+                frames += result.token_count
+                if result.token_count == 0:
+                    if samples:
+                        raise RuntimeError("Breeze ended with an invalid empty frame.")
+                    empty = True
+                    break
                 pcm = np.asarray(result.audio, dtype=np.float32).reshape(-1)
                 if not np.isfinite(pcm).all():
                     raise RuntimeError("Breeze decoder produced non-finite audio.")
@@ -300,3 +361,6 @@ class BreezeMouth:
         finally:
             generator.close()
             model.audio_tokenizer.decoder.reset_streaming_state()
+        if self.codec_context is not None and (empty or frames >= max_frames):
+            self.codec_context.clear(response_owner, "empty_or_capped_phrase")
+        return empty

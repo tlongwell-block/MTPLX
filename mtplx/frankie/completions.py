@@ -428,7 +428,7 @@ class Completions:
                 session_restore_mode="clone",
                 commit_prompt_state_to_bank=not getattr(job, "internal", False),
                 speculative_depth=self.engine.mtp, mtp_history_policy="committed",
-                verify_strategy="capture_commit", max_tokens=job.data["max_tokens"],
+                verify_strategy=self.engine.verify_strategy, max_tokens=job.data["max_tokens"],
                 sampler=brain_sampler(job.data),
                 thinking_guard=thinking_guard(self.engine.tokenizer, job.data["thinking"]),
                 seed=job.data.get("seed", int(uuid.uuid4().hex[:8], 16)),

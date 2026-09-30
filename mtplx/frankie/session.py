@@ -56,6 +56,8 @@ class Response:
     ready: Event = field(default_factory=Event)
     input: dict | None = None
     visible: bool = False
+    input_pending: bool = False
+    commit_requested: bool = False
     committed_at: float = 0.0
     text: str = ""
     chunks: list = field(default_factory=list)
@@ -274,6 +276,9 @@ class Session:
 
     def show(self, run):
         if run.visible or run.abort.is_set():
+            return
+        run.commit_requested = True
+        if run.input_pending:
             return
         if run.input is not None and not any(
             x["id"] == run.input["id"] for x in self.items
@@ -525,6 +530,13 @@ class Session:
             settings=copy.deepcopy(self.settings),
             speech_end_ms=(input_item or {}).get("_speech_end_ms", self.last_speech_ms),
         )
+        # A transcript-only brain cannot distinguish empty ASR from a new
+        # request. Validate automatic audio before exposing a response.
+        parts = (input_item or {}).get("content", [])
+        run.input_pending = (
+            tentative and getattr(self.engine, "brain_interface", None) == "text"
+            and bool(parts) and all(p["type"] == "input_audio" for p in parts)
+        )
         self.current = run
         history = list(self.items) + (
             [input_item]
@@ -575,20 +587,37 @@ class Session:
         self.spawn(self.generate(run, history))
         return run
 
+    def input_prepared(self, run, transcripts):
+        run.input_pending = False
+        if run.abort.is_set() or self.closed:
+            return
+        if not any(text.strip() for _, _, text in transcripts):
+            run.abort.set()
+            run.ready.set()
+            self.event("frankie.input.ignored", item_id=run.input["id"],
+                       reason="empty_transcript")
+            return
+        if run.commit_requested:
+            self.show(run)
+
     async def generate(self, run, history):
         result = None
         error = None
-        try:
-            result = await self.loop.run_in_executor(
-                self.executor,
-                lambda: self.engine.respond(
-                    history,
-                    run.settings,
-                    lambda k, v: self.emit(run, k, v),
-                    run.abort,
-                    session_id=self.id,
-                ),
+        def respond():
+            # Queued speculative input may be cancelled before the owner runs.
+            if run.abort.is_set() or self.closed:
+                return None
+            if run.input_pending:
+                transcripts = self.engine.prepare_audio(run.input)
+                self.loop.call_soon_threadsafe(self.input_prepared, run, transcripts)
+                if not any(text.strip() for _, _, text in transcripts):
+                    return None
+            return self.engine.respond(
+                history, run.settings, lambda k, v: self.emit(run, k, v),
+                run.abort, session_id=self.id,
             )
+        try:
+            result = await self.loop.run_in_executor(self.executor, respond)
         except Exception as exc:  # noqa: BLE001 — keep backend failures within this response.
             if not run.abort.is_set():
                 import traceback
@@ -596,6 +625,10 @@ class Session:
                 traceback.print_exc()
                 error = str(exc)
         run.generation_failed = error is not None
+        if error and run.input_pending:
+            run.input_pending = False
+            if run.commit_requested:
+                self.show(run)
         # Tool-only replies and immediate EOS can finish without emit's gate.
         # Retain their result until commitment, leaving the inference owner free.
         while not run.ready.is_set() and not run.abort.is_set() and not self.closed:
@@ -797,11 +830,14 @@ class Session:
     def yield_prefix(self, run, reason):
         """Discard old speech immediately; complete PCM still owns the next turn."""
         td = self.settings["turn_detection"]
-        if (run is None or self.current is not run or run.abort.is_set()
-                or run.playback_finished or not self.listening or td is None
+        if (run is None or self.current is not run or self.overlap_run is not run
+                or run.abort.is_set() or not self.listening or td is None
                 or not td.get("interrupt_response", True)):
             return False
-        self.rollback_unheard(run)
+        # A confirmed user turn can outlast the old playback tail. Retire its
+        # overlap without truncating speech already heard in full.
+        if not run.playback_finished:
+            self.rollback_unheard(run)
         self.overlap_run = None
         self.overlap_prefix_ms = 0
         self.prefix_yielded = True
@@ -1599,7 +1635,7 @@ class Session:
             if any(i["id"] == item["id"] for i in self.items):
                 raise ValueError("Duplicate conversation item id.")
             if self.current and not self.current.done:
-                if self.settings["background_tasks"] and item["type"] == "function_call_output":
+                if item["type"] == "function_call_output":
                     pass  # This result is visible only to a subsequent response snapshot.
                 elif self.settings["background_tasks"] and item.get("role") == "user":
                     interrupt = True
@@ -1662,9 +1698,9 @@ class Session:
                     for i in self.items
                 ):
                     raise ValueError("Tool result already supplied.")
+                if not isinstance(item.get("output"), str):
+                    raise ValueError("Tool output must be a string.")
                 if self.settings["background_tasks"]:
-                    if not isinstance(item.get("output"), str):
-                        raise ValueError("Tool output must be a string.")
                     task, accepted = self.task_ledger.complete(item["call_id"])
                     if accepted:
                         self.input_revision += 1

@@ -1,4 +1,5 @@
 """Low-reserve dispatch is restricted to opted-in disposable ear work."""
+from contextlib import nullcontext
 
 import asyncio
 from threading import Event
@@ -191,7 +192,7 @@ def test_engine_dispatches_between_audio_chunks_below_normal_reserve(monkeypatch
         token_callback([1, 2])
         return NS(stats=NS(to_dict=dict), finish_reason="stop")
 
-    def speak(text, rows):
+    def speak(text, rows, *, response_owner=None):
         for _ in range(2):
             yield [0.0] * 3840
             clock.now += .16
@@ -201,7 +202,7 @@ def test_engine_dispatches_between_audio_chunks_below_normal_reserve(monkeypatch
     monkeypatch.setattr(module, "generate_ar", generate)
     engine = module.Frankie.__new__(module.Frankie)
     engine.mtp, engine.runtime, engine.bank = mtp, NS(model=NS()), None
-    engine.audio = NS(speak=speak, reset_speech_context=lambda: None)
+    engine.audio = NS(speak=speak, speech_response=lambda: nullcontext(None), reset_speech_context=lambda *, response_owner=None: None)
     engine.tokenizer = NS(detokenizer=Detokenizer(), eos_token_ids=[0],
                           decode=lambda tokens: "".join(values[token] for token in tokens))
     engine.prompt = lambda *args, **kwargs: ([0], None)

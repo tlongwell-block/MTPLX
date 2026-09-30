@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from contextlib import nullcontext
 import json
 import re
 from itertools import groupby
@@ -42,14 +43,21 @@ def _overlap_step(self, x):
 
 
 class AudioModels:
-    def __init__(self, directory):
+    def __init__(self, directory, *, neural_bridges=True):
         from mlx_audio.tts.models.qwen3_tts import Model, ModelConfig
         from mlx_audio.tts.models.qwen3_tts import speech_tokenizer as codec
         from parakeet_mlx.utils import from_config
 
         root = Path(directory)
         cfg = json.loads((root / "frankie.json").read_text())
+        if not neural_bridges and cfg.get("mouth_type") != "breeze":
+            raise ValueError("The text brain interface currently requires a Breeze mouth.")
         self.weights = mx.load(str(root / cfg["conditioning"]))
+        if not neural_bridges:
+            self.weights = {
+                k: v for k, v in self.weights.items()
+                if not k.startswith(("ear.", "ear_tone.", "expression."))
+            }
         ear_path = root / cfg["ear"]
         self.ear = from_config(json.loads((ear_path / "config.json").read_text()))
         ew = mx.load(str(ear_path / "model.safetensors"))
@@ -60,12 +68,14 @@ class AudioModels:
             class_predicate=lambda p, m: p + ".scales" in ew,
         )
         self.ear.load_weights(list(ew.items()))
-        self.bridge = EarBridge(len(self.ear.vocabulary) + 1, 5120)
-        self.tone = EarTone(self.weights["ear_tone.word_emb"])
-        self.bridge.load_weights(self._weights("ear"))
-        self.tone.load_weights(
-            self._weights("ear_tone", exclude={"word_emb"}), strict=True
-        )
+        self.bridge = self.tone = None
+        if neural_bridges:
+            self.bridge = EarBridge(len(self.ear.vocabulary) + 1, 5120)
+            self.tone = EarTone(self.weights["ear_tone.word_emb"])
+            self.bridge.load_weights(self._weights("ear"))
+            self.tone.load_weights(
+                self._weights("ear_tone", exclude={"word_emb"}), strict=True
+            )
         mouth_path = root / cfg["mouth"]
         self.breeze = None
         codec.DecoderBlockUpsample.step = _overlap_step
@@ -76,8 +86,8 @@ class AudioModels:
             self._default_voice = self.breeze._default_voice
             mx.eval(
                 self.ear.parameters(),
-                self.bridge.parameters(),
-                self.tone.parameters(),
+                self.bridge.parameters() if self.bridge is not None else {},
+                self.tone.parameters() if self.tone is not None else {},
                 self.weights,
             )
             print(
@@ -154,11 +164,20 @@ class AudioModels:
         weights = dict(self._weights("vap"))
         return TurnWorker(weights) if weights else None
 
-    def reset_speech_context(self):
+    def speech_response(self):
+        context = self.breeze.codec_context if self.breeze is not None else None
+        return context.response() if context is not None else nullcontext(None)
+
+    def reset_speech_context(self, *, response_owner=None):
+        context = self.breeze.codec_context if self.breeze is not None else None
+        if context is not None and context._owner is not None:
+            context.require_owner(response_owner)
         if self.breeze is not None:
             self.breeze.model.reset_speech_context()
 
     def hear(self, pcm, rate=24000):
+        if self.bridge is None:
+            raise ValueError("Neural audio input requires matching trained brain bridges.")
         from parakeet_mlx.audio import get_logmel
         from parakeet_mlx.tokenizer import decode
 
@@ -243,7 +262,7 @@ class AudioModels:
         mx.eval(offset)
         return offset.reshape(self.speaker.shape).astype(self.speaker.dtype)
 
-    def speak(self, text, states, *, temperature=0.9):
+    def speak(self, text, states, *, temperature=0.9, response_owner=None):
         from num2words import num2words
 
         # Reuse Frankie's number expansion before the talker tokenizes words.
@@ -251,7 +270,7 @@ class AudioModels:
             r"\b\d+\b", lambda m: num2words(int(m[0])) if len(m[0]) < 15 else m[0], text
         )
         if self.breeze is not None:
-            yield from self.breeze.speak(text, states, temperature=temperature)
+            yield from self.breeze.speak(text, states, temperature=temperature, response_owner=response_owner)
             return
         self.offset = self.expression(states) if len(states) else None
         total_square = count = 0

@@ -30,16 +30,25 @@ from .detokenizing import new_detokenizer
 from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
 from .prompt_encoding import PromptEncoder
 from .sampling import brain_sampler, thinking_guard
+from .speech import phrase_complete
 from .thinking import public_tool_calls
 
 
 class Frankie:
-    def __init__(self, brain, audio, *, mtp=3):
+    brain_interface = "neural"
+    verify_strategy = "capture_commit"
+
+    def __init__(self, brain, audio, *, mtp=3, brain_interface="neural"):
+        if brain_interface not in {"neural", "text"}:
+            raise ValueError("Unknown brain interface.")
+        self.brain_interface = brain_interface
         self.runtime = load(brain, mtp=True)
         self.tokenizer = self.runtime.tokenizer
-        self.audio = AudioModels(audio)
+        self.audio = AudioModels(audio, neural_bridges=brain_interface == "neural")
         self.vision = load_vision_tower(brain)
         self.vision_spec = vision_spec_for_model_dir(brain)
+        if self.vision_spec.model_type == "qwen4_exp":
+            self.verify_strategy = "batched"
         self.image_config = json.loads(
             (Path(brain) / "preprocessor_config.json").read_text()
         )
@@ -77,7 +86,12 @@ class Frankie:
         transcripts = []
         for index, part in enumerate(item.get("content", [])):
             if part["type"] == "input_audio":
-                if "_rows" not in part:
+                if self.brain_interface == "text":
+                    if "_transcript" not in part:
+                        part["_transcript"] = self.audio.transcribe(
+                            part["_pcm"], part.get("_rate", 24000)
+                        )
+                elif "_rows" not in part:
                     part["_rows"], part["_transcript"] = self.audio.hear(
                         part["_pcm"], part.get("_rate", 24000)
                     )
@@ -124,7 +138,9 @@ class Frankie:
                 continue
             parts = []
             for part in item.get("content", []):
-                if part["type"] in {
+                if part["type"] == "input_audio" and self.brain_interface == "text":
+                    parts.append(part["_transcript"])
+                elif part["type"] in {
                     "input_text",
                     "text",
                     "output_text",
@@ -248,7 +264,7 @@ class Frankie:
             sampler=SamplerConfig(temperature=0),
             speculative_depth=max(1, self.mtp),
             mtp_history_policy="committed" if self.mtp else "cycle",
-            verify_strategy="capture_commit",
+            verify_strategy=self.verify_strategy,
             session_bank=self.bank if bank is None else bank,
             session_id=session_id,
             commit_prompt_state_to_bank=True,
@@ -258,6 +274,13 @@ class Frankie:
         )
 
     def respond(self, items, settings, emit, abort, *, session_id):
+        if abort.is_set():
+            raise InterruptedError("Response cancelled.")
+        scope = self.audio.speech_response() if "audio" in settings["output_modalities"] else nullcontext(None)
+        with scope as owner:
+            return self._respond(items, settings, emit, abort, session_id=session_id, speech_owner=owner)
+
+    def _respond(self, items, settings, emit, abort, *, session_id, speech_owner):
         started = time.monotonic()
 
         def check_abort():
@@ -265,7 +288,8 @@ class Frankie:
                 raise InterruptedError("Response cancelled.")
 
         check_abort()
-        self.audio.reset_speech_context()
+        if "audio" in settings["output_modalities"]:
+            self.audio.reset_speech_context(response_owner=speech_owner)
         ids, splice = self.prompt(items, settings, emit=emit, public_history=True)
         if len(ids) + settings["max_output_tokens"] > settings.get("context", 131072):
             raise ValueError("Conversation exceeds the configured context limit.")
@@ -283,6 +307,7 @@ class Frankie:
         text_ids = []
         speech_ids = []
         speech_states = []
+        speech_chunks = 0
         pending = deque()
         speaker = None
         all_text = ""
@@ -301,10 +326,11 @@ class Frankie:
         detokenizer = new_detokenizer(self)
 
         def chunk():
-            nonlocal speech_ids, speech_states
+            nonlocal speech_ids, speech_states, speech_chunks
             text = self.tokenizer.decode(speech_ids).strip()
             if text and re.search(r"\w", text):
-                pending.append((text, mx.stack(speech_states)))
+                pending.append((text, mx.stack(speech_states) if speech_states else []))
+                speech_chunks += 1
             speech_ids = []
             speech_states = []
 
@@ -342,7 +368,7 @@ class Frankie:
                         return
                     chunk_text, states = pending.popleft()
                     chunk_start = audio_seconds
-                    speaker = self.audio.speak(chunk_text, states)
+                    speaker = self.audio.speak(chunk_text, states, response_owner=speech_owner)
                 try:
                     pcm = next(speaker)
                 except StopIteration:
@@ -369,14 +395,7 @@ class Frankie:
             if not mouth_enabled or not speech_ids or in_thinking or in_tool:
                 return False
             current = self.tokenizer.decode(speech_ids).strip()
-            if value in {"<tool_call>", "<think>"} or (
-                value.startswith((" ", "\n"))
-                and (
-                    re.search(r"[.!?]$", current)
-                    or (len(current.split()) >= 4 and re.search(r"[;:,]$", current))
-                    or len(current.split()) >= 16
-                )
-            ):
+            if phrase_complete(current, value, first=speech_chunks == 0):
                 chunk()
                 return True
             return False
@@ -434,7 +453,8 @@ class Frankie:
                 finish_phrase(value)
                 if mouth_enabled:
                     speech_ids.append(token)
-                    speech_states.append(state)
+                    if state is not None:
+                        speech_states.append(state)
                 detokenizer.add_token(token)
                 all_text += detokenizer.last_segment
             flush_text()
@@ -462,9 +482,10 @@ class Frankie:
         try:
             # Text consumers need committed tokens, but no speech features or
             # their extra device synchronization and one-forward stream delay.
+            expression_features = getattr(self, "_expression_feature_stream", None)
             feature_stream = (
-                CommittedFeatures(self.runtime, len(ids), received)
-                if mouth_enabled
+                (expression_features or CommittedFeatures)(self.runtime, len(ids), received)
+                if mouth_enabled and (self.brain_interface == "neural" or expression_features is not None)
                 else nullcontext()
             )
             with feature_stream as features:
@@ -479,13 +500,16 @@ class Frankie:
                         check_abort()
 
                 callback = committed if features is not None else received
+                if expression_features is not None and features is not None:
+                    options["prompt_state_callback"] = features.bind_state
+                    options["graphbank_callback"] = features.bind_graphbank
                 if self.mtp:
                     result = generate_mtpk(
                         self.runtime,
                         ids,
                         speculative_depth=self.mtp,
                         mtp_history_policy="committed",
-                        verify_strategy="capture_commit",
+                        verify_strategy=self.verify_strategy,
                         token_callback=callback,
                         commit_prompt_state_to_bank=False,
                         **options,
@@ -525,4 +549,5 @@ class Frankie:
         finally:
             if speaker is not None:
                 speaker.close()
-            self.audio.reset_speech_context()
+            if mouth_enabled:
+                self.audio.reset_speech_context(response_owner=speech_owner)
