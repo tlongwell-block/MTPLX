@@ -46,6 +46,8 @@ class BreezeModel(Model):
             for _ in range(head.shape[0])
         ]
         self._voice_prefix = None
+        # Learned rows that stand in for an instruction's text (brain-led delivery).
+        self.instruction_rows = None
         self.context_mode = os.environ.get("MTPLX_FRANKIE_SPEECH_CONTEXT_MODE", "reset")
         if self.context_mode not in {"reset", "sliding"}:
             raise ValueError("Speech context mode must be reset or sliding")
@@ -128,7 +130,11 @@ class BreezeModel(Model):
         return values
 
     def _prompt_embeddings(self, *args, **kwargs):
-        target = super()._prompt_embeddings(*args, **kwargs)
+        rows = getattr(self, "instruction_rows", None)
+        if rows is not None and kwargs.get("instruct") and kwargs.get("ref_audio") is None:
+            target = self._learned_prompt(args[0] if args else kwargs["text"], kwargs.get("voice"))
+        else:
+            target = super()._prompt_embeddings(*args, **kwargs)
         if self._voice_prefix is None:
             raise ValueError("Breeze voice conditioning was not initialized.")
         if self.context_mode == "sliding" and self.context_words and self.context_rows:
@@ -153,6 +159,16 @@ class BreezeModel(Model):
                 flush=True,
             )
         return mx.concatenate([prefix, target], axis=1)
+
+    def _learned_prompt(self, text, voice):
+        """The directed prompt with instruction_rows where the instruction's tokens go."""
+        speaker = self._speaker(voice)
+        mark = self.tokenizer.convert_tokens_to_ids("<ins_bos>")
+        cut = self._text_ids(f"{speaker}<ins_bos>x<ins_eos>").tolist().index(mark)
+        plain = self.text_encoder_proj(self.text_encoder(self._text_ids(f"{speaker}{text}")[None]))
+        return mx.concatenate(
+            [plain[:, :cut], self.instruction_rows.astype(plain.dtype), plain[:, cut:]], axis=1
+        )
 
     def reference_prefix(self, pcm, transcript):
         ids = self._text_ids(f"[S0]{transcript}")
