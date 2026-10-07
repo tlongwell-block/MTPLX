@@ -98,7 +98,9 @@ class Session:
         self.tasks = set()
         self.history_prefill_enabled = os.environ.get("MTPLX_FRANKIE_IDLE_HISTORY_PREFILL") == "1"
         self.history_prefill_abort = Event()
-        self.history_prefill_run = None
+        self.history_prefill_revision = 0
+        self.history_prefill_key = None
+        self.history_prefill_task = None
         self.task_ledger = TaskLedger()
         self.task_history_count = 0
         self.input_revision = 0
@@ -234,47 +236,79 @@ class Session:
         task.add_done_callback(self.tasks.discard)
         return task
 
+    def invalidate_history_prefill(self):
+        self.history_prefill_abort.set()
+        self.history_prefill_revision += 1
+
     def prepare_idle_history(self):
-        """Best-effort prefix work after confirmed playback, yielding to input."""
-        run = self.current
-
-        def idle():
-            return (not self.closed and not self.listening and not self.manual_size
-                    and not self.semantic_pending and not self.queued_task_response
-                    and not self.settings["background_tasks"]
-                    and self.user_revision == self.response_revision
-                    and self.current is run and run is not None and run.done
-                    and not run.abort.is_set() and run.playback_finished
-                    and not run.tool_items and run.item is not None
-                    and run.item.get("status") == "completed"
-                    and not (self.listener is not None and self.listener.service.jobs))
-
-        if (not self.history_prefill_enabled or self.history_prefill_run is run
-                or not idle()):
+        """Warm settled, acknowledged history without delaying foreground work."""
+        submit = getattr(self.executor, "submit_idle_postcommit", None)
+        pending = getattr(self.executor, "foreground_pending", None)
+        if not self.history_prefill_enabled or submit is None or pending is None:
             return
-        # Tiny replies save little but still incur a model pass. Keep the
-        # normal foreground path for them, with no added cache work.
+        run = self.current
+        revision = self.history_prefill_revision
+        user_revision = self.user_revision
+        key = (revision, run.id if run else None, user_revision)
+
+        def eligible():
+            if (self.closed or self.current is not run or run is None or not run.done
+                    or self.history_prefill_revision != revision
+                    or self.user_revision != user_revision
+                    or self.user_revision != self.response_revision
+                    or self.manual_size or self.semantic_pending or self.queued_task_response
+                    or self.settings["background_tasks"] or run.tool_items
+                    or run.item is None or not any(item is run.item for item in self.items)
+                    or (self.listener is not None and self.listener.service.jobs)):
+                return False
+            if run.interrupted:
+                return run.abort.is_set()
+            return (not self.listening and not run.abort.is_set() and run.playback_finished
+                    and run.item.get("status") == "completed")
+
+        if not eligible() or self.history_prefill_key == key:
+            return
+        if self.history_prefill_task is not None and not self.history_prefill_task.done():
+            return
+        # Warming must never trigger ASR or vision for a new user turn.
+        for item in self.items:
+            for part in item.get("content", []):
+                kind = part.get("type")
+                if kind == "input_audio" and (
+                        "_transcript" not in part or
+                        (self.engine.brain_interface != "text" and "_rows" not in part)):
+                    return
+                if kind == "input_image" and "_rows" not in part:
+                    return
         words = sum(len(p.get("transcript", p.get("text", "")).split())
                     for p in run.item.get("content", []))
-        if words < 24:
+        if not run.interrupted and words < 24:
             return
-        self.history_prefill_run = run
         abort = self.history_prefill_abort = Event()
-        history, settings = snapshot_history(self.items), copy.deepcopy(self.settings)
+        history = snapshot_history(self.items)
+        settings = copy.deepcopy(self.settings)
 
         def interrupted():
-            return abort.is_set() or not idle()
+            return abort.is_set() or not eligible() or pending() > 0
 
         async def prepare():
             try:
-                await self.loop.run_in_executor(self.executor, lambda: self.engine.warm(
+                result = await asyncio.wrap_future(submit(lambda: self.engine.warm(
                     settings, session_id=self.id, history=history,
-                    abort_check=interrupted, prefill_step_size=lambda: 32))
-            except Exception:  # Best effort; normal prefill remains authoritative.
+                    abort_check=interrupted, prefill_step_size=lambda: 32)))
+                # A cancelled or stale preparation must not suppress a later retry.
+                if result is not None and not interrupted():
+                    self.history_prefill_key = key
+            except Exception:
                 if not interrupted():
                     logging.getLogger(__name__).warning("Idle history prefill failed", exc_info=True)
+            finally:
+                self.history_prefill_task = None
+                # Late playback truncation may have superseded the queued snapshot.
+                if self.history_prefill_revision != revision:
+                    self.prepare_idle_history()
 
-        self.spawn(prepare())
+        self.history_prefill_task = self.spawn(prepare())
 
     def show(self, run):
         if run.visible or run.abort.is_set():
@@ -508,7 +542,7 @@ class Session:
                 )
 
     def start(self, input_item=None, *, tentative=False, deferred_task_results=None):
-        self.history_prefill_abort.set()
+        self.invalidate_history_prefill()
         if (
             self.current is not None
             and not self.current.done
@@ -717,6 +751,7 @@ class Session:
         self.settle_task_results(run)
         self.event("response.done", response=response)
         self.maybe_start_task_response()
+        self.prepare_idle_history()
 
     def ready_task_results(self, *, retry=False):
         if not self.settings["background_tasks"]:
@@ -998,6 +1033,7 @@ class Session:
         for item_id in removed:
             self.event("conversation.item.deleted", item_id=item_id)
         self.event("frankie.input.merged", response_id=run.id)
+        self.invalidate_history_prefill()
 
     def discard_spec(self):
         if self.spec is None:
@@ -1146,6 +1182,8 @@ class Session:
                 run.item["_interrupted_draft"] = draft
             run.item["content"] = [{"type": "output_audio", "transcript": text}]
             run.text = text
+        self.invalidate_history_prefill()
+        self.prepare_idle_history()
 
     async def resolve_overlap(self, item, run, epoch, revision, queued_result, fragments):
         """Apply a final-utterance semantic decision, without dropping input."""
@@ -1239,7 +1277,7 @@ class Session:
         td = self.settings["turn_detection"]
         rate = self.settings["input_rate"]
         if td is None:
-            self.history_prefill_abort.set()
+            self.invalidate_history_prefill()
             if not self.manual_size:
                 self.capture_context = self.next_context()
                 self.capture_task_results = tuple(
@@ -1268,7 +1306,7 @@ class Session:
             voiced = probability >= td.get("threshold", 0.5)
             self.voice_run = self.voice_run + 1 if voiced else 0
             if voiced and not self.listening:
-                self.history_prefill_abort.set()
+                self.invalidate_history_prefill()
                 self.invalidate_semantics()
                 self.capture_task_results = tuple(
                     call_id for call_id in self.task_ledger.tasks
@@ -1455,7 +1493,7 @@ class Session:
         if (kind.startswith("conversation.") or kind in {
                 "session.update", "response.create", "response.cancel",
                 "input_audio_buffer.commit", "input_audio_buffer.clear", "frankie.voice.update"}):
-            self.history_prefill_abort.set()
+            self.invalidate_history_prefill()
         if kind == "frankie.input_context.update":
             revision, text = event["revision"], event["text"]
             if (
@@ -1915,6 +1953,7 @@ class Session:
                 content_index=0,
                 audio_end_ms=event["audio_end_ms"],
             )
+            self.prepare_idle_history()
         elif kind == "conversation.item.retrieve":
             item = next((i for i in self.items if i["id"] == event["item_id"]), None)
             if item is None:
@@ -1936,6 +1975,7 @@ class Session:
 
     async def close(self):
         self.closed = True
+        self.invalidate_history_prefill()
         self.cancel_prefix()
         if self.playback_wake is not None:
             self.playback_wake.cancel()
