@@ -48,6 +48,7 @@ class PairedGuidance:
         self.original_cache = model.backbone_model.make_cache
         self.original_depth = model._depth_tokens
         self.original_reset = model.reset_speech_context
+        self.original_hold = model.hold_speech
         self.shadow = empty_state()
         self.scale = 1.0
         self.active = False
@@ -64,6 +65,7 @@ class PairedGuidance:
         self.model.backbone_model.make_cache = self.make_cache
         self.model._depth_tokens = self.depth
         self.model.reset_speech_context = self.reset
+        self.model.hold_speech = self.hold
         self.installed = True
         return self
 
@@ -77,6 +79,12 @@ class PairedGuidance:
         self.original_reset()
         if not self.branch_depth:
             self.shadow = empty_state()
+
+    def hold(self):
+        """Keep the same newest phrases in both lanes."""
+        self.original_hold()
+        with self.branch("negative"):
+            self.original_hold()
 
     @contextmanager
     def branch(self, kind):

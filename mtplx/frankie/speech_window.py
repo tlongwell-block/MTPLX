@@ -75,3 +75,19 @@ def slide(model, required_rows):
         mx.eval([(c.keys, c.values) for c in cache])
         model._window_evictions += 1
         model._window_evicted_rows += removed
+
+
+def hold(model, words):
+    """Evict complete oldest phrases until at most ``words`` words remain."""
+    cache = model._speech_cache
+    if not cache:
+        return
+    removed = 0
+    while model._speech_segments and model._context_words > words:
+        count, rows = model._speech_segments.popleft()
+        model._context_words -= count
+        removed += rows
+    if removed:
+        for state in cache:
+            state.discard(model._voice_prefix.shape[0], removed)
+        mx.eval([(c.keys, c.values) for c in cache])

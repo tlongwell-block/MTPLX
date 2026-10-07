@@ -9,7 +9,7 @@ import pytest
 
 from mtplx.frankie.breeze import BreezeModel
 from mtplx.frankie.demo import delivery
-from mtplx.frankie.demo.delivery import LEARNED, PLAIN, Delivery, Reader, calibrated, readings
+from mtplx.frankie.demo.delivery import LEARNED, PLAIN, Delivery, Hold, Reader, calibrated, readings
 
 WIDTH = 6
 
@@ -84,7 +84,7 @@ def test_learned_prompt_puts_rows_where_the_instruction_goes():
 
 class Mouth:
     def __init__(self):
-        self.model = NS(generate=lambda *a, **k: iter(()), instruction_rows=None)
+        self.model = NS(generate=lambda *a, **k: iter(()), instruction_rows=None, hold_words=0)
         self.calls = []
         self.speak = self._speak
 
@@ -136,6 +136,42 @@ def test_install_wraps_engine_construction(assets, monkeypatch):
     engine = Engine()
     assert engine._expression_feature_stream.keywords == {"width": WIDTH}
     assert engine.audio.breeze.speak == engine._delivery.speak
+
+
+def test_hold_drops_held_speech_only_for_an_extreme_feeling():
+    hold, sad, happy, calm = Hold(), np.array([8.0, 0.0]), np.array([0.0, 6.0]), np.array([1.0, 1.0])
+    assert hold.why(sad, True) is None  # nothing held yet
+    hold.add(10, calm)
+    assert hold.why(np.array([4.0, 0.0]), False) is None  # a feeling, not an extreme one
+    assert hold.why(sad, False) == ("enter", 0, 8.0, 1.0)
+    hold.clear(); hold.add(10, sad)
+    assert hold.why(sad, False) is None  # the held voice already reads it
+    assert hold.why(calm, False) is None  # leaving is only judged at a reply's start
+    assert hold.why(calm, True) == ("leave", 0, 8.0, 1.0)
+    assert hold.why(np.array([3.0, 0.0]), True) is None
+    hold.add(5, happy)
+    hold.follow(6)  # Breeze evicted the oldest phrase
+    assert [w for w, _ in hold.held] == [5]
+
+
+def test_override_resets_both_lanes_before_the_phrase(assets, tmp_path):
+    mouth = Mouth()
+    resets = []
+    mouth.model.__dict__.update(hold_words=40, hold_speech=lambda: None, _speech_cache=[1], _context_words=12,
+                                reset_speech_context=lambda: resets.append(True))
+    reader = Reader(assets)
+    d = Delivery(mouth, reader, log=tmp_path)
+    mouth.guidance = NS(scale=1.0, in_step=lambda: True)
+    d._make_guidance = lambda: mouth.guidance
+    d.hold.add(12, np.array([0.0, 0.0]))
+    reader.read = lambda mean, n: dict(weights={"sad": 1.0}, rows=mx.zeros((1, 1, 4)), strength=4.0,
+                                       feelings=np.array([9.0, 0.0]))
+    list(mouth.speak("So sorry.", mx.zeros((2, WIDTH))))
+    assert resets == [True] and [w for w, _ in d.hold.held] == [2]
+    entry = json.loads((tmp_path / "delivery.jsonl").read_text())
+    assert entry["held"] == dict(rule="enter", feeling="sad", reading=9.0, held=0.0)
+    mouth.model.hold_speech()  # the engine's per-reply call marks the next phrase as a reply's first
+    assert d.reply_start
 
 
 REPLAY = os.environ.get("MTPLX_FRANKIE_DELIVERY_REPLAY")

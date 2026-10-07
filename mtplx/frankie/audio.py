@@ -173,7 +173,7 @@ class AudioModels:
         if context is not None and context._owner is not None:
             context.require_owner(response_owner)
         if self.breeze is not None:
-            self.breeze.model.reset_speech_context()
+            self.breeze.model.hold_speech()
 
     def hear(self, pcm, rate=24000):
         if self.bridge is None:

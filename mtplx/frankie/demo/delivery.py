@@ -12,11 +12,16 @@ guidance (guidance.py) pushes toward them. No sentence is ever written.
 A brain other than the one the directions were fitted on (27B) carries a
 ``flash-scale.npz`` that maps its readings onto the scale the adapter expects.
 
+With held speech on (MTPLX_FRANKIE_SPEECH_HOLD_WORDS), Breeze keeps Frankie's
+newest phrases from one reply to the next so he stays one speaker; an extreme
+feeling reading still drops them (Hold).
+
 Assets come from one folder: ``directions.npz``, ``words.npz``,
 ``calib-feelings.npz``, ``calib-words.npz``, ``adapter.npz``, optionally
 ``flash-scale.npz``, and ``rows/NAME.slot.safetensors`` for each name in the
 adapter's bank.
 """
+from collections import deque
 from contextvars import ContextVar
 import functools
 import json
@@ -90,6 +95,44 @@ class Reader:
                     feelings=np.array([round(float(x), 2) for x in zf]))
 
 
+class Hold:
+    """When the brain's feeling is extreme, it outranks the held voice.
+
+    Readings are on the adapter's scale, where 3 is a feeling and 6 a big moment:
+      enter  any phrase reads a feeling at ``hi`` or more that the held speech reads under hi - gap;
+      leave  a reply's first phrase reads under ``plain`` a feeling the held speech reads at hi or more.
+    Either way the held speech is dropped and the phrase starts from the voice reference.
+    The held speech's reading is the word-weighted mean over the phrases still in Breeze's window.
+    """
+
+    def __init__(self, hi=5.5, gap=2.0, plain=3.0):
+        self.hi, self.gap, self.plain = hi, gap, plain
+        self.held = deque()  # (words, feelings) per phrase, oldest first
+
+    def clear(self):
+        self.held.clear()
+
+    def follow(self, context_words):
+        """Forget phrases Breeze has evicted, oldest first."""
+        while self.held and sum(w for w, _ in self.held) > context_words:
+            self.held.popleft()
+
+    def why(self, z, start):
+        """The reason to drop the held speech before this phrase, or None."""
+        if not self.held:
+            return None
+        c = sum(w * h for w, h in self.held) / max(1, sum(w for w, _ in self.held))
+        j, k = int(z.argmax()), int(c.argmax())
+        if z[j] >= self.hi and c[j] < self.hi - self.gap:
+            return ("enter", j, float(z[j]), float(c[j]))
+        if start and c[k] >= self.hi and z[k] < self.plain:
+            return ("leave", k, float(c[k]), float(z[k]))
+        return None
+
+    def add(self, words, z):
+        self.held.append((words, np.asarray(z, float)))
+
+
 class Delivery:
     """Wraps one BreezeMouth so the brain leads every phrase it is given states for."""
 
@@ -110,6 +153,14 @@ class Delivery:
         self._make_guidance = lambda: PairedGuidance(
             model, lambda *a, **k: upstream(*a, repetition_penalty=penalty, **k),
             build_paired_depth(model)).install()
+        self.hold, self.reply_start = (Hold() if model.hold_words else None), False
+        if self.hold is not None:
+            hold_speech = model.hold_speech
+
+            def held():
+                hold_speech()
+                self.reply_start = True
+            model.hold_speech = held
         self._speak = mouth.speak
         self._inside = ContextVar("brain_led_inside", default=False)
         mouth.speak = self.speak
@@ -123,10 +174,12 @@ class Delivery:
             # Built at the first phrase, after the server has finished wrapping generate.
             self.guidance = self._make_guidance()
         g, model = self.guidance, self.mouth.model
-        row = None
+        row = why = None
         if getattr(states, "ndim", 0) == 2 and len(states) and states.shape[1] == self.reader.width:
             import mlx.core as mx
             row = self.reader.read(np.asarray(mx.mean(states.astype(mx.float32), axis=0)), len(states))
+            if self.hold is not None:
+                why = self._override(row["feelings"], len(text.split()))
         led = g.in_step()
         if led:
             model.instruction_rows = row and row["rows"]
@@ -143,9 +196,21 @@ class Delivery:
         finally:
             self._inside.reset(token)
             g.scale, model.instruction_rows = 1.0, None
-            self._record(text, states, row, led, first, samples, started)
+            self._record(text, states, row, why, led, first, samples, started)
 
-    def _record(self, text, states, row, led, first, samples, started):
+    def _override(self, feelings, words):
+        model, hold = self.mouth.model, self.hold
+        hold.follow(model._context_words if model._speech_cache else 0)
+        why = hold.why(feelings, self.reply_start)
+        self.reply_start = False
+        if why:
+            model.reset_speech_context()  # both lanes
+            hold.clear()
+        hold.add(words, feelings)
+        return why and dict(rule=why[0], feeling=self.reader.axes[why[1]],
+                            reading=round(why[2], 2), held=round(why[3], 2))
+
+    def _record(self, text, states, row, why, led, first, samples, started):
         """With a log folder: each phrase's choice in delivery.jsonl, its states in states/N.npy."""
         if self.log is None:
             return
@@ -159,7 +224,8 @@ class Delivery:
                      first_ms=first and round(first * 1000, 1), speech_s=round(samples / SAMPLE_RATE, 2),
                      took_s=round(time.perf_counter() - started, 2))
         if row is not None:
-            entry.update(weights=row["weights"], strength=row["strength"], feelings=row["feelings"].tolist())
+            entry.update(weights=row["weights"], strength=row["strength"], feelings=row["feelings"].tolist(),
+                         held=why)
         with open(self.log / "delivery.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
 

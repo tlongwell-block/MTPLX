@@ -64,6 +64,10 @@ class BreezeModel(Model):
         )
         if not 0 <= self.context_words <= 1000:
             raise ValueError("Breeze speech context must be zero to 1000 words.")
+        # Words of Frankie's own speech kept from one reply to the next; 0 starts every reply over.
+        self.hold_words = int(os.environ.get("MTPLX_FRANKIE_SPEECH_HOLD_WORDS", "0"))
+        if not 0 <= self.hold_words <= self.context_words:
+            raise ValueError("Held speech must be zero to the speech context's words.")
         if self.context_rows and not 1024 <= self.context_rows <= 8192:
             raise ValueError("Breeze speech context must be zero or 1024-8192 rows.")
         self._new_cache = self.backbone_model.make_cache
@@ -77,6 +81,15 @@ class BreezeModel(Model):
         self._max_frames = 0
         self._speech_segments = deque()
         self._chunk_start_rows = 0
+
+    def hold_speech(self):
+        """Between replies: keep the newest whole phrases, at most hold_words words, so the next
+        reply goes on in the same voice. Zero, or no sliding window, starts over from the reference."""
+        if not self.hold_words or self.context_mode != "sliding":
+            self.reset_speech_context()
+            return
+        from .speech_window import hold
+        hold(self, self.hold_words)
 
     def _generation_cache(self):
         if not self._continuing:
