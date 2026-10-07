@@ -14,6 +14,8 @@ from mlx_audio.lm.models.cache import KVCache
 from mlx_audio.lm.sample_utils import make_sampler
 from mlx_audio.tts.models.breeze_tts import Model, ModelConfig
 
+from .speech_instruction import validate_speech_instruction
+
 
 class TextEmbedding(nn.Module):
     """Keep Breeze's scaling and EOI override with a quantizable lookup."""
@@ -299,11 +301,16 @@ class BreezeMouth:
             instruction += " with a " + ("angry", "happy", "sad")[winner] + " tone"
         return instruction + "."
 
-    def speak(self, text, states, *, temperature=0.9, response_owner=None):
+    def speak(self, text, states, *, temperature=0.9, response_owner=None, speech_instruction=None):
+        speech_instruction = validate_speech_instruction(speech_instruction)
         if self.codec_context is not None:
             if response_owner is None:
                 with self.codec_context.response() as owner:
-                    yield from self.speak(text, states, temperature=temperature, response_owner=owner)
+                    if speech_instruction is None:
+                        yield from self.speak(text, states, temperature=temperature, response_owner=owner)
+                    else:
+                        yield from self.speak(text, states, temperature=temperature, response_owner=owner,
+                                               speech_instruction=speech_instruction)
                 return
             self.codec_context.require_owner(response_owner)
         if not isinstance(text, str) or not text.strip() or len(text.encode()) > 8192:
@@ -319,17 +326,21 @@ class BreezeMouth:
             scope = (self.codec_context.phrase(response_owner)
                      if self.codec_context is not None else nullcontext())
             with scope:
-                empty = yield from self._speak_attempt(text, states, temperature, max_frames, response_owner)
+                if speech_instruction is None:
+                    empty = yield from self._speak_attempt(text, states, temperature, max_frames, response_owner)
+                else:
+                    empty = yield from self._speak_attempt(text, states, temperature, max_frames, response_owner,
+                                                          speech_instruction=speech_instruction)
             if not empty:
                 return
             model.reset_speech_context()
         raise RuntimeError("Breeze produced no speech after a retry.")
 
-    def _speak_attempt(self, text, states, temperature, max_frames, response_owner):
+    def _speak_attempt(self, text, states, temperature, max_frames, response_owner, *, speech_instruction=None):
         model = self.model
         generator = model.generate(
             text,
-            instruct=self.instruction(states),
+            instruct=self.instruction(states) if speech_instruction is None else speech_instruction,
             stream=True,
             streaming_interval=0.08,
             temperature=temperature,

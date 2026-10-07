@@ -31,6 +31,7 @@ from .interruption import REGENERATION_INSTRUCTIONS, draft_notice
 from .prompt_encoding import PromptEncoder
 from .sampling import brain_sampler, thinking_guard
 from .speech import phrase_complete
+from .speech_instruction import validate_speech_instruction
 from .thinking import public_tool_calls
 
 
@@ -288,6 +289,9 @@ class Frankie:
                 raise InterruptedError("Response cancelled.")
 
         check_abort()
+        speech_instruction = validate_speech_instruction(settings.get("speech_instruction"))
+        if speech_instruction is not None and self.audio.breeze is None:
+            raise ValueError("speech_instruction requires the Breeze mouth.")
         if "audio" in settings["output_modalities"]:
             self.audio.reset_speech_context(response_owner=speech_owner)
         ids, splice = self.prompt(items, settings, emit=emit, public_history=True)
@@ -368,7 +372,11 @@ class Frankie:
                         return
                     chunk_text, states = pending.popleft()
                     chunk_start = audio_seconds
-                    speaker = self.audio.speak(chunk_text, states, response_owner=speech_owner)
+                    if speech_instruction is None:
+                        speaker = self.audio.speak(chunk_text, states, response_owner=speech_owner)
+                    else:
+                        speaker = self.audio.speak(chunk_text, states, response_owner=speech_owner,
+                                                   speech_instruction=speech_instruction)
                 try:
                     pcm = next(speaker)
                 except StopIteration:

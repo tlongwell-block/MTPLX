@@ -262,15 +262,24 @@ class AudioModels:
         mx.eval(offset)
         return offset.reshape(self.speaker.shape).astype(self.speaker.dtype)
 
-    def speak(self, text, states, *, temperature=0.9, response_owner=None):
+    def speak(self, text, states, *, temperature=0.9, response_owner=None, speech_instruction=None):
         from num2words import num2words
+        from .speech_instruction import validate_speech_instruction
+
+        speech_instruction = validate_speech_instruction(speech_instruction)
+        if speech_instruction is not None and self.breeze is None:
+            raise ValueError("speech_instruction requires the Breeze mouth.")
 
         # Reuse Frankie's number expansion before the talker tokenizes words.
         text = re.sub(
             r"\b\d+\b", lambda m: num2words(int(m[0])) if len(m[0]) < 15 else m[0], text
         )
         if self.breeze is not None:
-            yield from self.breeze.speak(text, states, temperature=temperature, response_owner=response_owner)
+            if speech_instruction is None:
+                yield from self.breeze.speak(text, states, temperature=temperature, response_owner=response_owner)
+            else:
+                yield from self.breeze.speak(text, states, temperature=temperature, response_owner=response_owner,
+                                             speech_instruction=speech_instruction)
             return
         self.offset = self.expression(states) if len(states) else None
         total_square = count = 0

@@ -203,6 +203,8 @@ class Session:
                 "streaming_listener": self.settings["streaming_listener"],
                 "semantic_listener_available": self.listener is not None,
                 "assistant_name": self.settings["assistant_name"],
+                **({"speech_instruction": self.settings["speech_instruction"]}
+                   if "speech_instruction" in self.settings else {}),
             },
             "output_modalities": self.settings["output_modalities"],
             "instructions": self.settings["instructions"],
@@ -1476,6 +1478,15 @@ class Session:
             settings = event["session"]
             new = copy.deepcopy(self.settings)
             extensions = settings.get("frankie", {})
+            if "speech_instruction" in extensions:
+                from .speech_instruction import validate_speech_instruction
+                instruction = validate_speech_instruction(extensions["speech_instruction"])
+                if instruction is not None and self.engine.audio.breeze is None:
+                    raise ValueError("speech_instruction requires the Breeze mouth.")
+                if instruction is None:
+                    new.pop("speech_instruction", None)
+                else:
+                    new["speech_instruction"] = instruction
             if "playback_feedback" in extensions:
                 if type(extensions["playback_feedback"]) is not bool:
                     raise ValueError("playback_feedback must be a boolean.")
