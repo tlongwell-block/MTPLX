@@ -52,6 +52,7 @@ def serve(args):
     import uvicorn
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, HTMLResponse
+    from starlette.websockets import WebSocketState
 
     from .engine import Frankie
     from .session import Session
@@ -250,6 +251,10 @@ def serve(args):
                         error={"type": "invalid_request_error", "message": str(exc)},
                     )
                 except RuntimeError as exc:
+                    # After a disconnect, receive raises RuntimeError forever
+                    # without yielding; reporting it would spin this loop.
+                    if WebSocketState.DISCONNECTED in (ws.client_state, ws.application_state):
+                        break
                     session.event(
                         "error", error={"type": "server_error", "message": str(exc)},
                     )
