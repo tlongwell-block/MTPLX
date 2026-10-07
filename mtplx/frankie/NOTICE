@@ -1,0 +1,16 @@
+Frankie's trained adapter layers and CPU VAD implementation are extracted from
+its reference MLX implementation. Parakeet and Qwen3-TTS inference reuse the
+parakeet-mlx and mlx-audio packages in the same process.
+
+Breeze text-to-speech inference also reuses mlx-audio. Brain hidden states
+condition its emotion instruction; generated text supplies the spoken words.
+Breeze checkpoint license terms are retained with the model artifact.
+
+The CPC/ALiBi turn projection is adapted from MaAI, Copyright (c) 2025 MaAI
+Development Team, MIT licensed. See LICENSE-MaAI.
+
+The duplex browser audio worklet is adapted from Block's Buzz realtime demo,
+Copyright Block, Inc., licensed under Apache-2.0. See LICENSE-Buzz.
+
+Powered by MTPLX
+https://github.com/youssofal/MTPLX

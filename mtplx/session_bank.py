@@ -300,10 +300,9 @@ class CacheMissReason(str, Enum):
 
 
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
-    h = hashlib.sha256()
-    for token in token_ids:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-    return h.hexdigest()
+    # Preserve existing cache keys, including signed media-token identities.
+    tokens = np.fromiter(map(int, token_ids), dtype="<i8")
+    return hashlib.sha256(tokens).hexdigest()
 
 
 def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
@@ -735,6 +734,7 @@ class SessionBank:
         extra_state: dict[str, Any] | None = None,
         gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
         timing_out: dict[str, Any] | None = None,
+        abort_check: Callable[[], bool] | None = None,
     ) -> SessionBankEntry | None:
         # timing_out: optional request-local dict the CALLER owns (never
         # shared bank state — puts run concurrently across the foreground,
@@ -749,6 +749,8 @@ class SessionBank:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
+        if abort_check is not None and abort_check():
+            return None
         self.last_put_nbytes = 0
         self.last_put_skipped_oversized_snapshot = False
         self._touch_session(session_id)
@@ -838,6 +840,8 @@ class SessionBank:
                 has_recurrent=cache_has_recurrent,
                 gdn_boundaries=list(normalized_boundaries),
             )
+            if abort_check is not None and abort_check():
+                return None
             self.eviction_log.append(
                 {
                     "reason": reason,
@@ -1005,9 +1009,15 @@ class SessionBank:
         )
         if timing_out is not None:
             timing_out["entry_build_s"] = time.perf_counter() - trunk_snapshot_done
+        # Snapshot evaluation can outlive a speculative request. Do not let an
+        # abandoned audio prefix supersede the reusable conversation history.
+        if abort_check is not None and abort_check():
+            return None
         if lazy_kv:
             self._schedule_snapshot_settle(entry, timing_out=timing_out)
         self._enqueue_cold_entry(entry, timing_out=timing_out)
+        if abort_check is not None and abort_check():
+            return None
         self._entries[tokens] = entry
         self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
@@ -1304,7 +1314,7 @@ class SessionBank:
                 continue
             if _entry.has_recurrent:
                 _gap = int(_entry.prefix_len) - _cand
-                if _gap > gap_limit:
+                if _boundary_true_restore_enabled() or _gap > gap_limit:
                     _probe = getattr(
                         _entry, "recurrent_boundary_at_or_below", None
                     )
@@ -1646,7 +1656,7 @@ class SessionBank:
         entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(token_ids)
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -1701,19 +1711,17 @@ class SessionBank:
 
         # kvcache-v2 boundary-true restore: on hybrid models a sub-prefix
         # restore must land on a token where the recurrent state is *known*,
-        # not merely where the KV can trim. Restoring KV to `matched` while
-        # recurrent state stays at the stored end silently degrades answers
-        # (Desktop QA, pre-v2). Tiny gaps (<= near-prefix gap limit) keep the
-        # long-shipped tokenizer-drift tolerance; anything larger requires a
-        # stored boundary <= matched and restores there instead, with the
-        # caller re-prefilling (boundary, prompt_end].
+        # not merely where the KV can trim. Even one changed token invalidates
+        # the later recurrent state. Restore a captured boundary <= matched,
+        # or decline this candidate so the caller can prefill correctly.
         restore_point = matched
         boundary_snapshot: CacheSnapshot | None = None
         boundary_hidden: Any | None = None
         gap_from_entry = int(entry.prefix_len) - matched
         needs_boundary = (
             bool(entry.has_recurrent)
-            and gap_from_entry > _near_prefix_tiny_gap_limit()
+            and (gap_from_entry > 0 if _boundary_true_restore_enabled()
+                 else gap_from_entry > _near_prefix_tiny_gap_limit())
         )
         if needs_boundary:
             boundary = entry.recurrent_boundary_at_or_below(matched)

@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><title>Frankie v5 · MTPLX</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 16px/1.5 system-ui;
+      background: #0c1118;
+      color: #e1e8ef;
+    }
+    body {
+      max-width: 920px;
+      margin: auto;
+      padding: 32px 22px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h1 {
+      font-size: 30px;
+      letter-spacing: -1px;
+      margin: 0;
+    }
+    small,
+    .muted {
+      color: #98a9ba;
+    }
+    a {
+      color: #8acbff;
+    }
+    .panel {
+      background: #151e29;
+      border: 1px solid #2b3b4b;
+      border-radius: 16px;
+      padding: 20px;
+      margin: 18px 0;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button,
+    select,
+    textarea,
+    input {
+      font: inherit;
+      border-radius: 9px;
+      border: 1px solid #3e5165;
+      color: inherit;
+      background: #1b2a39;
+      padding: 9px 14px;
+    }
+    button {
+      cursor: pointer;
+    }
+    button.primary {
+      background: #84d9ba;
+      color: #091e19;
+      font-weight: 650;
+      border: 0;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      resize: vertical;
+      margin-bottom: 10px;
+      background: #101923;
+    }
+    label {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+    }
+    #status {
+      color: #84d9ba;
+    }
+    #log {
+      min-height: 220px;
+      max-height: 55vh;
+      overflow: auto;
+    }
+    .message {
+      white-space: pre-wrap;
+      padding: 12px 0;
+      border-bottom: 1px solid #2b3b4b;
+    }
+    .message.user {
+      color: #a7bfd2;
+    }
+    .message strong {
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #89a3ba;
+    }
+    details {
+      margin-top: 15px;
+    }
+    input[type="file"] {
+      max-width: 100%;
+      font-size: 13px;
+    }
+    #meter {
+      height: 4px;
+      background: #30424c;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 15px;
+    }
+    #level {
+      height: 100%;
+      background: #84d9ba;
+      width: 0;
+    }
+    #stats {
+      font-size: 12px;
+      margin-top: 12px;
+      color: #98a9ba;
+    }
+    .presence {
+      display: grid;
+      justify-items: center;
+      gap: 22px;
+      padding: 30px 0;
+    }
+    #orb {
+      width: 190px;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      position: relative;
+      background: radial-gradient(circle at 35% 30%, #b9f8e1, #4b9f98 48%, #173e58 80%);
+      box-shadow: inset -12px -20px 35px #0b213a88, 0 0 45px #5dd3b422;
+      transform: scale(var(--voice-scale, 1));
+      transition: transform 90ms linear;
+    }
+    #orb::before {
+      content: "";
+      position: absolute;
+      inset: -16px;
+      border: 1px solid #8acbff88;
+      border-radius: 50%;
+      transform: scale(var(--input-scale, 1));
+      transition: transform 90ms linear;
+    }
+    #interaction { color: #a7c9db; min-height: 24px; }
+    #tasks:empty { display: none; }
+    .task { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+    .task span { flex: 1; }
+    .task button { padding: 3px 10px; font-size: 13px; }
+    @media (prefers-reduced-motion: reduce) {
+      #orb, #orb::before { transform: none; transition: none; }
+    }
+  </style>
+  <header>
+    <div>
+      <h1>Frankie</h1>
+      <small>Live voice, text and images</small>
+    </div>
+    <a
+      href="https://github.com/youssofal/MTPLX"
+      target="_blank"
+      rel="noreferrer"
+      >Powered by MTPLX</a
+    >
+  </header>
+  <section class="panel">
+    <div class="presence">
+      <div id="orb" aria-hidden="true"></div>
+      <span id="interaction" role="status">Ready when you are</span>
+    </div>
+    <div class="controls">
+      <button class="primary" id="start">Start conversation</button
+      ><button id="stop" disabled>End</button
+      ><button id="interrupt" disabled>Interrupt</button
+      ><span id="status">Ready to connect</span>
+      <label>Mode <select id="mode">
+        <option value="baseline">Baseline</option>
+        <option value="v5" selected>v5 experimental</option>
+      </select></label>
+    </div>
+    <div id="meter"><div id="level"></div></div>
+    <details>
+      <summary>Conversation settings</summary>
+      <div class="controls" style="margin: 12px 0">
+        <label
+          >Thinking
+          <select id="thinking">
+            <option value="off">Off</option>
+            <option>minimal</option>
+            <option>low</option>
+            <option>medium</option>
+            <option>high</option>
+            <option value="xhigh">Extra high</option>
+          </select></label
+        ><label
+          ><input type="checkbox" id="speak" checked />Speak responses</label
+        >
+      </div>
+      <label><input type="checkbox" id="demoTool" />Enable fictional demo lookup</label>
+      <p class="muted">Optional: ask for the demo weather or travel time. The lookup takes six seconds and uses sample data only.</p>
+      <label
+        >Voice reference
+        <input id="voice" type="file" accept="audio/wav" /></label
+      ><input
+        id="voiceText"
+        placeholder="Reference transcript (optional)"
+        style="width: 90%; margin-top: 10px"
+      /><button id="setVoice" style="margin-top: 10px">Use this voice</button>
+      <p class="muted">
+        Your microphone stays active while Frankie speaks. You can interrupt
+        naturally.
+      </p>
+    </details>
+    <div id="stats"></div>
+    <small id="features"></small>
+    <div id="tasks" aria-live="polite"></div>
+  </section>
+  <section class="panel"><div id="log" aria-live="polite"></div></section>
+  <section class="panel">
+    <textarea
+      id="text"
+      rows="2"
+      placeholder="Type a message, or attach an image…"
+    ></textarea>
+    <div class="controls">
+      <button id="send" disabled>Send</button
+      ><input type="file" id="image" accept="image/*" />
+    </div>
+  </section>
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    let ws,
+      ctx,
+      node,
+      tracks,
+      current,
+      ready = false,
+      active = false,
+      pendingText = false;
+    const messages = new Map(),
+      evidence = [];
+    let lastPlayback = null;
+    let playbackState = null, clearedResponseId = null, responseFailed = false;
+    let playbackFeedback = false,
+      lastFeedback = -Infinity;
+    const taskRows = new Map();
+    const demoCalls = new Map();
+    const demoTool = {
+      type: "function", name: "demo_lookup",
+      description: "A fictional demonstration lookup taking six seconds. Returns sample weather or travel time; never live information.",
+      parameters: {
+        type: "object", properties: { topic: { type: "string", enum: ["weather", "travel"] } },
+        required: ["topic"], additionalProperties: false,
+      },
+    };
+    window.frankieTest = { evidence, send: (event) => send(event) };
+    function record(type, data = {}) {
+      evidence.push({ time: performance.now(), type, ...data });
+      if (evidence.length > 20000) evidence.shift();
+    }
+    function recordServerEvent(e) {
+      // Keep diagnostic text locally; never retain raw media or credentials.
+      const detail = { response_id: e.response_id || e.response?.id, item_id: e.item_id };
+      if (e.type === "conversation.item.input_audio_transcription.completed" ||
+          e.type === "response.output_audio_transcript.done" || e.type === "response.output_text.done")
+        detail.text = e.transcript ?? e.text;
+      if (e.type === "frankie.interaction.prefix" || e.type === "frankie.interaction.observed") {
+        for (const key of ["action", "gate", "apply", "transcript", "previous_transcript",
+          "recheck_transcript", "observed_audio_ms", "decision_audio_ms", "apply_lag_ms", "causal_cutoff", "decision"])
+          if (e[key] !== undefined) detail[key] = e[key];
+      }
+      if (e.type === "response.done") {
+        detail.status = e.response.status;
+        detail.status_details = e.response.status_details;
+      }
+      if (e.type === "frankie.metrics") {
+        detail.metrics = {};
+        for (const key of ["generated_tokens", "finish_stop_origin", "audio_seconds", "wall_seconds",
+          "decode_tok_s", "cached_tokens", "new_prefill_tokens", "session_cache_hit", "mode",
+          "speculative_depth", "accepted_drafts", "drafted_tokens", "repetition_stop_triggered",
+          "repetition_stop_reason", "loop_guard", "thinking_guard"])
+          if (e.metrics[key] !== undefined) detail.metrics[key] = e.metrics[key];
+      }
+      record(e.type, detail);
+    }
+    function send(event) {
+      if (ws?.readyState === 1) ws.send(JSON.stringify(event));
+    }
+    function status(text) {
+      $("status").textContent = text;
+    }
+    function base64(pcm) {
+      let s = "";
+      for (const n of new Uint8Array(
+        pcm.buffer,
+        pcm.byteOffset,
+        pcm.byteLength,
+      ))
+        s += String.fromCharCode(n);
+      return btoa(s);
+    }
+    function message(id, role, text = "") {
+      let row = messages.get(id);
+      if (!row) {
+        const div = document.createElement("div");
+        div.className = "message " + role;
+        const title = document.createElement("strong");
+        title.textContent = role === "user" ? "You" : "Frankie";
+        row = document.createElement("span");
+        div.append(title, row);
+        $("log").append(div);
+        messages.set(id, row);
+      }
+      row.textContent = text;
+      $("log").scrollTop = $("log").scrollHeight;
+      return row;
+    }
+    function settings() {
+      const thinking = $("thinking").value;
+      send({
+        type: "session.update",
+        session: {
+          thinking,
+          max_output_tokens: Math.min(8192,
+            512 +
+            { off: 0, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 16384 }[
+              thinking
+            ]),
+          output_modalities: [$("speak").checked ? "audio" : "text"],
+          instructions: "You are Frankie, a helpful voice assistant. Everything you say is spoken aloud. Use natural, unformatted conversational language. Be clear and concise, and never claim to have done work before doing it.",
+          tools: $("demoTool").checked ? [demoTool] : [],
+          ...($("demoTool").checked ? {
+            instructions: "Speak conversationally in plain, unformatted text. Use demo_lookup only when asked for demo weather or demo travel time. Its results are fictional examples, not real information." +
+              ($("speak").checked ? " The user hears your public text as speech and cannot hear a tool call. When starting requested work, first give one brief natural acknowledgment in public text before the tool call, then do the work. Do not claim a result before it arrives." : ""),
+          } : {}),
+          ...($("mode").value === "v5" ? {
+            frankie: {
+              interruption_policy: "semantic",
+              playback_feedback: true,
+              playback_pause: false,
+              streaming_listener: "backchannel",
+              background_tasks: true,
+            },
+          } : {}),
+        },
+      });
+    }
+    function clearPlayback(responseId) {
+      node?.port.postMessage({ type: "clear", requestId: "interrupt", responseId });
+      if (!responseId || responseId === playbackState?.responseId || (!playbackState && responseId === current)) {
+        clearedResponseId = responseId || playbackState?.responseId || current;
+        playbackState = null;
+        lastPlayback = null;
+        updateVoiceActivity();
+      }
+    }
+    function updateVoiceActivity() {
+      status(playbackState ? (playbackState.paused ? "Listening" : "Speaking")
+        : responseFailed ? "Response failed"
+        : active && current !== clearedResponseId ? "Responding" : "Listening");
+      if (playbackState) interaction(playbackState.paused ? "listen" : "continue");
+      else if ($("interaction").textContent === "Listening while speaking") interaction("listen");
+    }
+    function onPlaybackState(data) {
+      const p = data.playback;
+      if (!p || p.responseId !== playbackState?.responseId || p.itemId !== playbackState?.itemId) return;
+      if (data.type === "position" || data.type === "paused") {
+        lastPlayback = p;
+        if (data.type !== "paused") return;
+        playbackState.paused = true;
+      } else if (data.type === "finished" || data.type === "stopped") {
+        playbackState = null;
+        lastPlayback = null;
+      } else return;
+      updateVoiceActivity();
+    }
+    function interaction(state, reason) {
+      const labels = {
+        listen: "Listening", continue: "Listening while speaking",
+        adapt: "Adjusting the reply", yield: "Your turn", stop: "Waiting for you", task: "Working in the background",
+      };
+      if (!labels[state]) return;
+      $("interaction").textContent = labels[state];
+      $("interaction").title = reason || "";
+      record("interaction", { state, reason });
+    }
+    function feedback(type, playback) {
+      if (!playbackFeedback || !playback) return;
+      const now = performance.now();
+      if (type === "position" && now - lastFeedback < 250) return;
+      lastFeedback = now;
+      send({
+        type: "frankie.playback." + type,
+        item_id: playback.itemId,
+        response_id: playback.responseId,
+        audio_end_ms: Math.floor(playback.playedSamples / 24),
+      });
+    }
+    function updateTask(task, cancellationRequested = false) {
+      if (cancellationRequested || task.status === "cancelled" || task.status === "superseded") stopDemoCall(task.call_id);
+      let entry = taskRows.get(task.call_id);
+      if (!entry) {
+        const row = document.createElement("div");
+        row.className = "task";
+        const label = document.createElement("span"), cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.onclick = () => {
+          cancel.disabled = true;
+          stopDemoCall(task.call_id);
+          send({ type: "frankie.task.cancel", call_id: task.call_id });
+        };
+        row.append(label, cancel);
+        $("tasks").append(row);
+        entry = { row, label, cancel };
+        taskRows.set(task.call_id, entry);
+      }
+      entry.label.textContent = `${task.name || "Task"} · ${cancellationRequested ? "cancellation requested" : task.status}`;
+      entry.cancel.disabled = task.status !== "running" || cancellationRequested;
+    }
+    function stopDemoCall(id) {
+      const call = demoCalls.get(id);
+      if (!call) {
+        // Cancellation may arrive before the final function arguments.
+        demoCalls.set(id, { cancelled: true });
+        return;
+      }
+      clearTimeout(call.timer);
+      call.cancelled = true;
+    }
+    function runDemoCall(call) {
+      if (!$("demoTool").checked || call.name !== "demo_lookup" || !call.call_id || demoCalls.has(call.call_id)) return;
+      const pending = { cancelled: false }, socket = ws;
+      demoCalls.set(call.call_id, pending);
+      pending.timer = setTimeout(() => {
+        if (pending.cancelled || ws !== socket || socket.readyState !== 1) return;
+        let result;
+        try {
+          const { topic } = JSON.parse(call.arguments);
+          result = topic === "weather"
+            ? { fictional: true, weather: "clear skies", temperature_celsius: 20 }
+            : topic === "travel"
+              ? { fictional: true, travel_minutes: 42 }
+              : { error: "Choose the weather or travel demo topic." };
+        } catch {
+          result = { error: "Demo lookup arguments must be valid JSON." };
+        }
+        send({
+          type: "conversation.item.create",
+          item: { type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result) },
+        });
+        send({ type: "response.create" });
+        record("demo_tool_result", { call_id: call.call_id });
+      }, 6000);
+    }
+    async function onEvent(e) {
+      recordServerEvent(e);
+      if (e.type === "session.created") {
+        settings();
+        return;
+      }
+      if (e.type === "session.updated") {
+        playbackFeedback = e.session?.frankie?.playback_feedback === true;
+        const features = e.session?.frankie || {};
+        $("features").textContent = $("mode").value === "baseline"
+          ? "Baseline turn handling"
+          : [
+            features.streaming_listener === "backchannel" ? "Quick turn-taking · brief nods keep playback going"
+              : features.interruption_policy === "semantic" ? "Semantic turn handling"
+              : features.interruption_policy === "observe" ? "Listener observation only" : "Semantic listener unavailable",
+            features.background_tasks ? "Background tasks enabled" : "Background tasks unavailable",
+          ].join(" · ");
+        ready = true;
+        node?.port.postMessage({ type: "capture", enabled: true });
+        status("Listening");
+        $("send").disabled = false;
+        interaction("listen");
+        updateVoiceActivity();
+        return;
+      }
+      if (e.type === "input_audio_buffer.speech_started") {
+        // Audio activity is not necessarily an interruption. The MTPLX server
+        // owns that decision and sends frankie.playback.clear when appropriate.
+        return;
+      }
+      if (e.type === "frankie.interaction") {
+        if (e.state === "continue") updateVoiceActivity();
+        else interaction(e.state, e.reason);
+        return;
+      }
+      if (e.type === "frankie.task.updated") {
+        updateTask(e.task, e.cancellation_requested);
+        return;
+      }
+      if (e.type === "response.function_call_arguments.done") {
+        runDemoCall(e);
+        return;
+      }
+      if (e.type === "response.created") {
+        active = true;
+        current = e.response.id;
+        responseFailed = false;
+        interaction("listen");
+        updateVoiceActivity();
+        return;
+      }
+      if (e.type === "conversation.item.created") {
+        const i = e.item;
+        if (i.type === "message" && ["user", "assistant"].includes(i.role)) {
+          const text = i.content
+            .map(
+              (p) =>
+                p.text ||
+                p.transcript ||
+                (p.type === "input_audio"
+                  ? "[Voice message]"
+                  : p.type === "input_image"
+                    ? "[Image]"
+                    : ""),
+            )
+            .join("\n");
+          message(i.id, i.role, text);
+        }
+        if (pendingText && i.type === "message" && i.role === "user") {
+          pendingText = false;
+          send({ type: "response.create" });
+        }
+        return;
+      }
+      if (
+        e.type === "conversation.item.input_audio_transcription.completed"
+      ) {
+        message(e.item_id, "user", e.transcript);
+        return;
+      }
+      if (e.type === "response.output_audio_transcript.done" || e.type === "response.output_text.done") {
+        message(e.item_id, "assistant", e.transcript ?? e.text);
+        return;
+      }
+      if (
+        e.type === "response.output_text.delta" ||
+        e.type === "response.output_audio_transcript.delta"
+      ) {
+        const row = message(
+          e.item_id,
+          "assistant",
+          messages.get(e.item_id)?.textContent || "",
+        );
+        row.textContent += e.delta;
+        $("log").scrollTop = $("log").scrollHeight;
+        return;
+      }
+      if (e.type === "response.output_audio.done") {
+        node?.port.postMessage({ type: "done", itemId: e.item_id });
+        return;
+      }
+      if (e.type === "response.output_audio.delta") {
+        const b = Uint8Array.from(atob(e.delta), (c) => c.charCodeAt(0));
+        const pcm = new Int16Array(b.buffer);
+        if (pcm.length && e.response_id === current && e.response_id !== clearedResponseId) {
+          if (playbackState?.responseId !== e.response_id || playbackState?.itemId !== e.item_id) {
+            playbackState = { responseId: e.response_id, itemId: e.item_id, paused: false };
+            updateVoiceActivity();
+          }
+        }
+        record("audio_received", { itemId: e.item_id, samples: pcm.length });
+        node.port.postMessage(
+          { type: "audio", responseId: e.response_id, itemId: e.item_id, pcm },
+          [pcm.buffer],
+        );
+        return;
+      }
+      if (e.type === "frankie.playback.clear") {
+        clearPlayback(e.response_id);
+        return;
+      }
+      if (e.type === "frankie.playback.pause" || e.type === "frankie.playback.resume") {
+        node?.port.postMessage({
+          type: e.type.endsWith("pause") ? "pause" : "resume",
+          responseId: e.response_id,
+        });
+        if (playbackState?.responseId === e.response_id) {
+          playbackState.paused = e.type.endsWith("pause");
+          updateVoiceActivity();
+        }
+        return;
+      }
+      if (e.type === "response.done") {
+        if (e.response.id !== current) return;
+        active = false;
+        responseFailed = e.response.status === "failed";
+        updateVoiceActivity();
+        record("response_status", { responseId: e.response.id, status: e.response.status });
+        if (e.response.status === "failed")
+          message(
+            "error_" + Date.now(),
+            "assistant",
+            e.response.status_details.error.message,
+          );
+        return;
+      }
+      if (e.type === "frankie.metrics") {
+        $("stats").textContent =
+          `MTP ${e.metrics.speculative_depth || 0} · ${e.metrics.accepted_drafts || 0}/${e.metrics.drafted_tokens || 0} drafts accepted · ${Number(e.metrics.audio_seconds).toFixed(1)}s audio`;
+        return;
+      }
+      if (e.type === "frankie.voice.updated") {
+        status("Voice updated");
+        return;
+      }
+      if (e.type === "error") {
+        status(e.error.message);
+        record("error", { message: e.error.message });
+      }
+    }
+    async function start() {
+      const token = location.hash.slice(1);
+      if (!token) {
+        status("Open the complete private launch URL.");
+        return;
+      }
+      $("start").disabled = true;
+      $("mode").disabled = true;
+      $("demoTool").disabled = true;
+      status("Connecting…");
+      try {
+        ctx = new AudioContext({ sampleRate: 24000 });
+        await ctx.resume();
+        await ctx.audioWorklet.addModule("/audio-worklet.mjs?v=completed-playback");
+        node = new AudioWorkletNode(ctx, "duplex-audio", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+        node.connect(ctx.destination);
+        node.port.onmessage = ({ data }) => {
+          if (data.type === "capture" && ready) {
+            if (ws.bufferedAmount > 24000 * 4) {
+              status("Connection cannot keep up with live audio.");
+              end();
+              return;
+            }
+            send({
+              type: "input_audio_buffer.append",
+              audio: base64(data.pcm),
+              playback: base64(data.playback),
+            });
+            let peak = 0;
+            for (const x of data.pcm) peak = Math.max(peak, Math.abs(x));
+            $("level").style.width = Math.min(100, peak / 100) + "%";
+            let outputPeak = 0;
+            for (const x of data.playback) outputPeak = Math.max(outputPeak, Math.abs(x));
+            $("orb").style.setProperty("--input-scale", 1 + Math.min(0.25, peak / 32768));
+            $("orb").style.setProperty("--voice-scale", 1 + Math.min(0.18, outputPeak / 32768));
+            record("capture", { samples: data.pcm.length });
+          } else if (data.type === "position" || data.type === "paused") {
+            onPlaybackState(data);
+            record("playback", { ...data.playback });
+            // Report the exact held position immediately for heard-prefix
+            // rollback; a pause is not an interruption or a truncation.
+            if (data.type === "paused") lastFeedback = -Infinity;
+            feedback("position", data.playback);
+          } else if (data.type === "finished") {
+            onPlaybackState(data);
+            record("playback_finished", data.playback);
+            feedback("finished", data.playback);
+          } else if (data.type === "stopped" && data.playback) {
+            onPlaybackState(data);
+            const p = data.playback;
+            send({
+              type: "conversation.item.truncate",
+              item_id: p.itemId,
+              content_index: 0,
+              audio_end_ms: Math.floor(p.playedSamples / 24),
+            });
+            record("playback_stopped", p);
+          } else if (data.type === "underrun") {
+            record("underrun", { itemId: data.itemId });
+          } else if (data.type === "error") {
+            status(data.message);
+            record("error", { message: data.message });
+          }
+        };
+        tracks = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        ctx.createMediaStreamSource(tracks).connect(node);
+        ws = new WebSocket(
+          (location.protocol === "https:" ? "wss://" : "ws://") +
+            location.host +
+            "/v1/realtime",
+          ["realtime", "openai-insecure-api-key." + token],
+        );
+        const socket = ws;
+        socket.onmessage = (e) => {
+          if (ws === socket)
+            onEvent(JSON.parse(e.data)).catch((e) => status(e.message));
+        };
+        socket.onclose = () => {
+          if (ws !== socket) return;
+          status("Disconnected");
+          end();
+        };
+        socket.onerror = () => {
+          if (ws === socket) status("Connection failed");
+        };
+        $("stop").disabled = false;
+        $("interrupt").disabled = false;
+      } catch (e) {
+        status(e.message);
+        await end();
+      }
+    }
+    async function end() {
+      ready = false;
+      active = false;
+      pendingText = false;
+      current = null;
+      playbackFeedback = false;
+      lastFeedback = -Infinity;
+      lastPlayback = null;
+      playbackState = null;
+      clearedResponseId = null;
+      responseFailed = false;
+      taskRows.clear();
+      for (const call of demoCalls.values()) clearTimeout(call.timer);
+      demoCalls.clear();
+      $("tasks").replaceChildren();
+      $("features").textContent = "";
+      $("interaction").textContent = "Ready when you are";
+      $("orb").style.setProperty("--input-scale", 1);
+      $("orb").style.setProperty("--voice-scale", 1);
+      tracks?.getTracks().forEach((t) => t.stop());
+      tracks = null;
+      node?.port.postMessage({ type: "capture", enabled: false });
+      if (node) node.port.onmessage = null;
+      node = null;
+      const socket = ws;
+      ws = null;
+      socket?.close();
+      const audioContext = ctx;
+      ctx = null;
+      await audioContext?.close().catch(() => {});
+      $("start").disabled = false;
+      $("mode").disabled = false;
+      $("demoTool").disabled = $("mode").value !== "v5";
+      $("stop").disabled = true;
+      $("interrupt").disabled = true;
+      $("send").disabled = true;
+      record("ended");
+    }
+    $("start").onclick = start;
+    $("mode").onchange = () => {
+      $("demoTool").disabled = $("mode").value !== "v5";
+      if ($("demoTool").disabled) $("demoTool").checked = false;
+    };
+    $("stop").onclick = () => {
+      status("Call ended");
+      return end();
+    };
+    $("interrupt").onclick = () => {
+      send({ type: "response.cancel", response_id: current });
+      clearPlayback();
+    };
+    $("thinking").onchange = $("speak").onchange = () => {
+      if (ready) settings();
+    };
+    $("setVoice").onclick = async () => {
+      if (!ready) {
+        status("Start a conversation first.");
+        return;
+      }
+      const file = $("voice").files[0];
+      if (file)
+        send({
+          type: "frankie.voice.update",
+          wav: base64(new Uint8Array(await file.arrayBuffer())),
+          transcript: $("voiceText").value || undefined,
+        });
+    };
+    $("send").onclick = async () => {
+      if (active) {
+        status("Interrupt the current response first.");
+        return;
+      }
+      const text = $("text").value.trim(),
+        image = $("image").files[0],
+        content = [];
+      if (text) content.push({ type: "input_text", text });
+      if (image)
+        content.push({
+          type: "input_image",
+          image_url: `data:${image.type};base64,${base64(new Uint8Array(await image.arrayBuffer()))}`,
+        });
+      if (!content.length) return;
+      pendingText = true;
+      send({
+        type: "conversation.item.create",
+        item: { type: "message", role: "user", content },
+      });
+      $("text").value = "";
+      $("image").value = "";
+    };
+  </script>
+</html>

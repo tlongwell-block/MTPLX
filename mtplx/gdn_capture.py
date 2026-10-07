@@ -3009,6 +3009,8 @@ def forward_with_gdn_capture(
     hidden_states = inner.embed_tokens(inputs)
     if cache is None:
         cache = [None] * len(inner.layers)
+    features = getattr(text_model, "_mtplx_feature_stream", None)
+    feature_offset = features.offset(cache) if features is not None else 0
 
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
@@ -3088,6 +3090,8 @@ def forward_with_gdn_capture(
             h = hidden_states + r
             mlp_input = layer.post_attention_layernorm(h)
         hidden_states = h + layer.mlp(mlp_input)
+        if features is not None and layer_idx == features.layer:
+            features.record(inputs, hidden_states, cache, feature_offset)
         if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
             mx.eval(hidden_states)
 
