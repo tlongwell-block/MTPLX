@@ -1314,7 +1314,7 @@ class SessionBank:
                 continue
             if _entry.has_recurrent:
                 _gap = int(_entry.prefix_len) - _cand
-                if _gap > gap_limit:
+                if _boundary_true_restore_enabled() or _gap > gap_limit:
                     _probe = getattr(
                         _entry, "recurrent_boundary_at_or_below", None
                     )

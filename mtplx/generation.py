@@ -3821,7 +3821,7 @@ def _restore_near_prefix_prompt_state(
             continue
         if getattr(entry, "has_recurrent", False):
             gap_from_entry = int(getattr(entry, "prefix_len", 0) or 0) - matched
-            if gap_from_entry > max_gap:
+            if _boundary_true_restore_enabled() or gap_from_entry > max_gap:
                 # Boundary-true restores land at the newest recurrent boundary
                 # at/below `matched`, not at `matched` itself. A candidate is
                 # only worth taking when that achievable point still beats the
