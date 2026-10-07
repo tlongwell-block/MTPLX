@@ -300,6 +300,58 @@ The existing session cache limits still apply; no additional model is loaded.
 The server default remains off. Set `MTPLX_FRANKIE_IDLE_HISTORY_PREFILL=0` or
 omit the export to keep it off when memory or idle compute is constrained.
 
+## Run the live demo
+
+`python -m mtplx.frankie.demo` starts the same server with everything the
+live demo adds on top, installed in this order:
+
+1. **Watermark** (`demo/watermark.py`): AudioSeal's 16-bit streaming generator
+   marks final speech PCM with a fixed experiment tag, `0xF601`.
+2. **MaAI turn-taking** (`demo/maai.py`): MaAI's BC-Det head decides from sound
+   whether speech that overlaps Frankie is a nod or a real turn.
+3. **Seed**: MLX is seeded with 1900 at each session's first reply.
+4. **Telemetry** (`demo/telemetry.py`): per-stage first-audio latency.
+5. **Brain-led delivery** (`demo/delivery.py`): the brain's states for each
+   phrase choose learned Breeze instruction rows and a guidance strength. With
+   held speech on, Breeze keeps Frankie's last 40 words from one reply to the
+   next, and an extreme feeling reading drops them.
+
+Server options and `MTPLX_*` settings default to the demo's (text brain
+interface, `turbo` profile, MTP 2, one HTTP slot, sliding 250-word speech
+context, 40 held words; the full list is `SETTINGS` in `demo/__main__.py`).
+Anything set on the command line or in the environment wins.
+
+The demo needs torch and two packages installed without their dependencies:
+MaAI's GUI and microphone stack is never imported, and AudioSeal must carry its
+unmerged streaming-state fix ([PR 106](https://github.com/facebookresearch/audioseal/pull/106)).
+
+```sh
+python -m pip install -e '.[frankie,frankie-demo]'
+python -m pip install --no-deps maai==0.2.18 \
+  'audioseal @ git+https://github.com/facebookresearch/audioseal@ab35ea6add4856f2a4ae0668230e6d69697d3f6a'
+```
+
+No weights ship with MTPLX. Pass each folder by path:
+
+- `--delivery`: `directions.npz`, `words.npz`, `calib-feelings.npz`,
+  `calib-words.npz`, `adapter.npz`, and `rows/NAME.slot.safetensors` for each
+  row set the adapter names. A brain other than the one the directions were
+  fitted on also carries `flash-scale.npz`. These are fitted to one brain.
+- `--maai`: `bc_det.pt` (BC-Det) and `mimi.onnx` with `mimi.json` (its encoder).
+- `--watermark`: AudioSeal's `generator_streaming.pth` (SHA256
+  `f5eb3076c1748940578993edd18ecd4fbdbc387fe7613a77f420af921d83eb74`).
+
+```sh
+export MTPLX_FRANKIE_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+python -m mtplx.frankie.demo \
+  --brain /path/to/brain --audio /path/to/Frankie-audio --voice /path/to/voice.wav \
+  --delivery /path/to/delivery --maai /path/to/maai --watermark /path/to/generator_streaming.pth \
+  --port 18870 --log /path/to/run
+```
+
+With `--log`, each phrase's delivery choice goes to `delivery.jsonl`, its brain
+states to `states/`, and each reply's watermark status to `watermark.jsonl`.
+
 ## Duplex and agent harnesses
 
 `session.frankie.input_context` advertises optional context for the next user input.

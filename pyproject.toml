@@ -80,6 +80,12 @@ frankie = [
   "websockets>=14",
   "gguf>=0.18",
 ]
+frankie-demo = [
+  "torch==2.14.0",
+  "onnxruntime==1.30.0",
+  "einops==0.8.2",
+  "omegaconf==2.3.1",
+]
 competitors = [
   "dflash-mlx==0.1.0",
 ]
