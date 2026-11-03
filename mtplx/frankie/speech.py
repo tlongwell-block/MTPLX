@@ -2,7 +2,7 @@
 import re
 
 
-def phrase_complete(text, next_token, *, first):
+def phrase_complete(text, next_token, *, first, hungry=False):
     if not text:
         return False
     if next_token in {'<tool_call>', '<think>'}:
@@ -16,6 +16,10 @@ def phrase_complete(text, next_token, *, first):
     # An initial in a name is not a sentence boundary.
     if re.search(r'(?:^|\s)[A-Z]\.$', ending):
         return False
+    # The mouth has said everything it was given and is about to fall
+    # silent: any sentence or clause end, or four words, beats dead air.
+    if hungry and (count >= 4 or re.search(r'[.!?;:,]$', ending)):
+        return True
     if re.search(r'[.!?]$', ending) and (first or count >= 6):
         return True
     # Later clauses can use the already playing speech as a head start.

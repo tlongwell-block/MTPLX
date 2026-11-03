@@ -27,6 +27,15 @@ class Boundaries(unittest.TestCase):
         self.assertTrue(phrase_complete(' '.join(['word']*16), ' next', first=True))
         self.assertFalse(phrase_complete('Hello.', 'ing', first=True))
 
+    def test_hungry_mouth_takes_four_words_at_a_word_boundary(self):
+        self.assertFalse(phrase_complete('That kind of tired where', ' your', first=False))
+        self.assertTrue(phrase_complete('That kind of tired', ' where', first=False, hungry=True))
+        self.assertFalse(phrase_complete('That kind of', ' tired', first=False, hungry=True))
+        self.assertFalse(phrase_complete('That kind of tir', 'ed', first=False, hungry=True))
+        self.assertTrue(phrase_complete('I hear you.', ' That', first=False, hungry=True))
+        self.assertFalse(phrase_complete('I hear you.', ' That', first=False))
+        self.assertFalse(phrase_complete('The Love Song of J.', ' Alfred', first=False, hungry=True))
+
 
 class EmptySpeech(unittest.TestCase):
     def mouth(self, attempts):

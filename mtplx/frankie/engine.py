@@ -405,7 +405,9 @@ class Frankie:
             if not mouth_enabled or not speech_ids or in_thinking or in_tool:
                 return False
             current = self.tokenizer.decode(speech_ids).strip()
-            if phrase_complete(current, value, first=speech_chunks == 0):
+            # Breeze speaks at about real time, so an idle mouth only loses lead.
+            hungry = speaker is None and not pending and audio_start is not None
+            if phrase_complete(current, value, first=speech_chunks == 0, hungry=hungry):
                 chunk()
                 return True
             return False
