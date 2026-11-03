@@ -69,6 +69,8 @@ class Reader:
         self.axes = [str(x) for x in self.feelings["axes"]]
         self.bank = [str(x) for x in self.adapter["bank"]]
         self.rows = {n: mx.load(str(folder / "rows" / f"{n}.slot.safetensors"))["theta"] for n in self.bank}
+        # mx.load is lazy and binds to the loading thread's streams; the model owner thread has none of them.
+        mx.eval(list(self.rows.values()))
         self.width = int(self.feelings["mu"].shape[-1])
         if self.words["mu"].shape[-1] != self.width:
             raise ValueError("Feeling and word directions read different brain widths")
