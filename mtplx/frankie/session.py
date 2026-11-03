@@ -97,6 +97,9 @@ class Session:
         self.closed = False
         self.tasks = set()
         self.history_prefill_enabled = os.environ.get("MTPLX_FRANKIE_IDLE_HISTORY_PREFILL") == "1"
+        # Silence before a private speculative reply starts. Nothing it makes
+        # is published until the turn is released, and resumed speech drops it.
+        self.speculate_ms = int(os.environ.get("MTPLX_FRANKIE_SPECULATE_MS", "96"))
         self.history_prefill_abort = Event()
         self.history_prefill_revision = 0
         self.history_prefill_key = None
@@ -1412,7 +1415,7 @@ class Session:
                     if semantic_overlap:
                         can_start = False
                     if (
-                        self.silence >= 96
+                        self.silence >= self.speculate_ms
                         and self.spec is None
                         and (not self.prefix_yielded
                              or self.settings["streaming_listener"] == "backchannel")
