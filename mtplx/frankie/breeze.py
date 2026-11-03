@@ -46,6 +46,11 @@ class BreezeModel(Model):
             for _ in range(head.shape[0])
         ]
         self._voice_prefix = None
+        # A fresh speech context starts from the voice prefix's keys and
+        # values, computed once per voice. Causal attention gives those rows
+        # the same values whatever follows them.
+        self.prefix_kv = os.environ.get("MTPLX_FRANKIE_BREEZE_PREFIX_KV", "1") == "1"
+        self._voice_kv = None
         # Learned rows that stand in for an instruction's text (brain-led delivery).
         self.instruction_rows = None
         self.context_mode = os.environ.get("MTPLX_FRANKIE_SPEECH_CONTEXT_MODE", "reset")
@@ -94,6 +99,13 @@ class BreezeModel(Model):
     def _generation_cache(self):
         if not self._continuing:
             self._speech_cache = self._new_cache()
+            if getattr(self, "prefix_kv", False):
+                # The prompt left the voice prefix out: start from its rows.
+                known = self._voice_kv
+                if known is None or known[0] is not self._voice_prefix:
+                    raise RuntimeError("Breeze voice prefix rows are stale")
+                for cache, state in zip(self._speech_cache, known[1]):
+                    cache.state = state
             self._speech_segments.clear()
             if self.context_mode == "sliding":
                 from .speech_window import SpeechWindowCache
@@ -165,6 +177,9 @@ class BreezeModel(Model):
             prefix = self.backbone_model.embed_tokens(eos)
         else:
             prefix = self._voice_prefix[None].astype(target.dtype)
+            if getattr(self, "prefix_kv", False):
+                self._cache_voice(prefix)
+                prefix = prefix[:, :0]
         self._chunk_start_rows = cached if self._continuing else self._voice_prefix.shape[0]
         if self.context_rows:
             print(
@@ -172,6 +187,15 @@ class BreezeModel(Model):
                 flush=True,
             )
         return mx.concatenate([prefix, target], axis=1)
+
+    def _cache_voice(self, prefix):
+        known = self._voice_kv
+        if known is None or known[0] is not self._voice_prefix or known[2] != prefix.dtype:
+            cache = self._new_cache()
+            self.backbone_model(input_embeddings=prefix, cache=cache)
+            states = [c.state for c in cache]
+            mx.eval(states)
+            self._voice_kv = (self._voice_prefix, states, prefix.dtype)
 
     def _learned_prompt(self, text, voice):
         """The directed prompt with instruction_rows where the instruction's tokens go."""
