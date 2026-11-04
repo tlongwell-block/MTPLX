@@ -10,8 +10,10 @@ pass through as they were.
 ``install`` wraps ``Frankie.respond`` for responses whose ``output_rate`` is
 48000; 24 kHz responses are untouched. ``Stream`` is causal with a fixed
 lookahead: each push emits what it can see LOOKAHEAD past, the rest waits for
-the next push. A phrase's end flushes it, so its chunk mark follows its last
-sample without waiting on the next phrase.
+the next push or the response's end. Windows start on the STFT hop grid, so
+any partition of the input renders the same samples as the whole signal. A
+phrase mark waits until its last sample is out: flushing there would render
+its tail without the speech that follows.
 """
 from collections import deque
 from functools import wraps
@@ -26,6 +28,7 @@ RATE, OUTPUT_RATE = 24000, 48000
 CROSSOVER_HZ = (10500, 11500)  # input bins below, a linear blend across, model bins above
 LOOKAHEAD = 960  # 40 ms at 24 kHz: streamed output matches a whole-signal render (-95 dB above 12 kHz)
 CONTEXT = 2880  # 120 ms of history per window
+HOP = 80  # window origins that reproduce the whole render (measured: 40, one STFT hop, does not)
 
 
 def _upsampler(width=6, rolloff=0.99):
@@ -143,10 +146,8 @@ class Extender:
 class Stream:
     """One response's causal 24 -> 48 kHz stream."""
 
-    ratio = OUTPUT_RATE // RATE
-
-    def __init__(self, extender, *, lookahead=LOOKAHEAD, context=CONTEXT):
-        self.extend, self.lookahead, self.context = extender, lookahead, context
+    def __init__(self, extender, *, lookahead=LOOKAHEAD, context=CONTEXT, hop=HOP):
+        self.extend, self.lookahead, self.context, self.hop = extender, lookahead, context, hop
         self.pcm = np.empty(0, np.float32)  # input from absolute sample `start`
         self.start = self.done = self.received = 0
 
@@ -164,14 +165,18 @@ class Stream:
     def _emit(self, end):
         if end <= self.done:
             return np.empty(0, np.float32)
-        lo = max(self.start, self.done - self.context)
+        lo = self._origin(self.done)
         hi = min(self.received, end + self.lookahead)
         y = self.extend(self.pcm[lo - self.start:hi - self.start])
         out = y[2 * (self.done - lo):2 * (end - lo)]
         self.done = end
-        keep = max(self.start, self.done - self.context)
+        keep = self._origin(self.done)
         self.pcm, self.start = self.pcm[keep - self.start:], keep
         return out
+
+    def _origin(self, done):
+        # Context before `done`, rounded down onto the hop grid (start is on it too).
+        return max(self.start, (done - self.context) // self.hop * self.hop)
 
 
 def install(engine_class, extender, report=None):
@@ -201,7 +206,7 @@ def install(engine_class, extender, report=None):
                 publish(stream.push(value))
             elif kind == "chunk":
                 marks.append((stream.received, value))
-                publish(stream.finish())
+                publish(np.empty(0, np.float32))
             else:
                 emit(kind, value)
 
