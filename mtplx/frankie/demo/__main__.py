@@ -6,7 +6,8 @@
         --watermark ASSETS/generator_streaming.pth [--log RUN]
 
 On top of the plain server this installs, in order: the AudioSeal watermark
-on final speech, MaAI turn-taking, one fixed sampling seed per session,
+on final speech, MaAI turn-taking, listening sounds (with --backchannels),
+one fixed sampling seed per session,
 first-audio latency telemetry, and brain-led delivery with the held voice.
 Server options and MTPLX_* settings default to the live demo's; anything
 given on the command line or already in the environment wins.
@@ -74,6 +75,8 @@ def main(argv=None):
                         help="AudioSeal generator_streaming.pth (16 bits).")
     parser.add_argument("--hifi", type=Path,
                         help="AP-BWE 24 -> 48 kHz weights: lets a session ask for 48 kHz speech.")
+    parser.add_argument("--backchannels", type=Path,
+                        help="Listening-sound takes (perf/make_backchannels.py): sessions may opt in to them.")
     parser.add_argument("--log", type=Path, help="Folder for delivery.jsonl, phrase states and watermark.jsonl.")
     args = parser.parse_args(argv)
 
@@ -83,7 +86,7 @@ def main(argv=None):
     torch.set_num_interop_threads(1)
     configure_runtime(args.brain, args.profile, brain_interface=args.brain_interface)
     from mtplx.frankie import engine
-    from . import delivery, hifi, maai, telemetry, watermark
+    from . import backchannels, delivery, hifi, maai, telemetry, watermark
 
     if args.log:
         args.log.mkdir(parents=True, exist_ok=True)
@@ -97,6 +100,8 @@ def main(argv=None):
     if args.hifi:  # outside the watermark: it extends the marked speech, leaving its band as it is
         hifi.install(engine.Frankie, hifi.Extender(args.hifi))
     maai.install(maai.Detector(args.maai))
+    if args.backchannels:
+        backchannels.install(backchannels.Takes(args.backchannels))
     seed_sessions(engine.Frankie)
     telemetry.install()
     delivery.install(engine.Frankie, args.delivery, log=args.log)

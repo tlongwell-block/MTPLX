@@ -299,13 +299,16 @@ class TurnWorker:
                 break
 
     def release(self, clock_ms, silence_ms):
+        """Whether the user's pause gives Frankie the turn. The confidence VAP must show
+        falls from 0.4 at the 320 ms endpoint to 0.15 by 480 ms; one second always does."""
         reading = self.latest
+        need = max(0.15, 0.4 - 0.25 * (silence_ms - 320) / 160)
         return (
             self.failed
             or reading is None
-            or silence_ms >= 1500
+            or silence_ms >= 1000
             or not 0 <= clock_ms - reading[0] / 16 <= 500
-            or reading[1] >= 0.4
+            or reading[1] >= need
         )
 
     def close(self):

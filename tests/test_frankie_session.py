@@ -782,3 +782,18 @@ def test_output_rate_is_offered_only_when_the_engine_can_make_it():
         assert run.emitted_ms == 100
 
     asyncio.run(setup(check))
+
+
+def test_turn_gate_needs_less_confidence_as_the_pause_grows():
+    from mtplx.frankie.turn import TurnWorker
+
+    def release(p, silence_ms, failed=False, end_ms=1000):
+        reading = (end_ms * 16, p, 0.0)
+        return TurnWorker.release(NS(failed=failed, latest=reading), 1000, silence_ms)
+
+    assert not release(0.39, 320) and release(0.4, 320)
+    assert not release(0.19, 448) and release(0.21, 448)
+    assert not release(0.14, 480) and release(0.16, 480)
+    assert not release(0.14, 992) and release(0.0, 1000)
+    assert release(0.0, 320, end_ms=400)  # stale reading: the gate stands aside
+    assert release(0.0, 320, failed=True)
