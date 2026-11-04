@@ -30,7 +30,7 @@ def test_fires_mid_turn_when_the_model_expects_a_listener_sound():
     ("p_bc", 0.39),  # not a backchannel moment
     ("p_sys", 0.15),  # the turn may be passing to Frankie
     ("end_ms", 2600),  # reading too old for now
-    ("end_ms", 1400),  # too early in the user's turn
+    ("end_ms", 2400),  # too early in the user's turn
 ])
 def test_holds_when_the_reading_says_no(change, value):
     assert not due(session(), reading(**{change: value}))

@@ -22,7 +22,7 @@ import numpy as np
 
 P_BC = 0.4  # backchannel score to fire at
 P_SYS = 0.15  # above this the turn may be passing to Frankie: stay quiet
-MIN_TURN_MS = 1500  # into the user's turn before the first sound
+MIN_TURN_MS = 2500  # into the user's turn before the first sound
 GAP_MS = 6000  # between sounds
 FRESH_MS = 300  # the reading must cover audio this recent
 
