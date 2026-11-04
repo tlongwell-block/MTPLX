@@ -133,6 +133,7 @@ class Session:
             "context": 131072,
             "tools": [],
             "input_rate": 24000,
+            "output_rate": 24000,
             "background_tasks": False,
             "interruption_policy": "vad",
             "assistant_name": "Frankie",
@@ -228,7 +229,7 @@ class Session:
                     },
                     "turn_detection": self.settings["turn_detection"],
                 },
-                "output": {"format": {"type": "audio/pcm", "rate": 24000}},
+                "output": {"format": {"type": "audio/pcm", "rate": self.settings["output_rate"]}},
             },
             "tools": self.settings["tools"],
         }
@@ -441,7 +442,7 @@ class Session:
             if not run.first_audio_at:
                 run.first_audio_at = time.monotonic()
             raw_size = len(value) // 4 * 3 - (2 if value.endswith("==") else value.endswith("="))
-            run.emitted_ms += raw_size * 1000 / (24000 * 2)
+            run.emitted_ms += raw_size * 1000 / (run.settings.get("output_rate", 24000) * 2)
             self.event("response.output_audio.delta", delta=value, **common)
         elif kind == "text":
             run.text += value
@@ -1615,6 +1616,12 @@ class Session:
                 if rate not in {16000, 24000}:
                     raise ValueError("PCM input rate must be 16000 or 24000.")
                 new["input_rate"] = rate
+            output = settings.get("audio", {}).get("output", {})
+            if "format" in output:
+                rate = int(output["format"].get("rate", 24000))
+                if rate not in getattr(self.engine, "output_rates", (24000,)):
+                    raise ValueError("Unsupported PCM output rate.")
+                new["output_rate"] = rate
             if new == self.settings:
                 self.event("session.updated", session=self.info())
                 return

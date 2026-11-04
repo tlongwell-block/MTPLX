@@ -63,6 +63,18 @@ def test_reader_weights_rows_and_strength(assets):
     assert read["feelings"].shape == (2,)
 
 
+def test_boost_raises_strength_and_nothing_else(assets, monkeypatch):
+    mean = np.random.default_rng(2).normal(size=WIDTH)
+    plain = Reader(assets).read(mean, 5)
+    monkeypatch.setenv("MTPLX_FRANKIE_DELIVERY_BOOST", "1")
+    boosted = Reader(assets).read(mean, 5)
+    assert boosted["strength"] == plain["strength"] + 1 and boosted["weights"] == plain["weights"]
+    for bad in ("0.3", "2.5", "-1"):
+        monkeypatch.setenv("MTPLX_FRANKIE_DELIVERY_BOOST", bad)
+        with pytest.raises(ValueError):
+            Reader(assets)
+
+
 def test_reader_maps_another_brain_onto_the_adapter_scale(assets):
     mean = np.random.default_rng(3).normal(size=WIDTH)
     plain = Reader(assets).read(mean, 20)["feelings"]

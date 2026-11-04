@@ -5,7 +5,8 @@ mean is read against fixed directions (16 feelings, 24 words), each reading
 scored against phrases of the same length, so a short "Hey there!" does not
 read as the most excited thing ever said. A small adapter maps the 40
 readings to weights over learned Breeze instruction row sets and to a
-guidance strength (3, 3.5 or 4: every new scale costs Breeze a recompile).
+guidance strength (3, 3.5 or 4, raised by MTPLX_FRANKIE_DELIVERY_BOOST: every
+new scale costs Breeze a recompile).
 The weighted rows take the instruction's place in Breeze's prompt, and paired
 guidance (guidance.py) pushes toward them. No sentence is ever written.
 
@@ -25,6 +26,7 @@ from collections import deque
 from contextvars import ContextVar
 import functools
 import json
+import os
 from pathlib import Path
 import time
 
@@ -71,6 +73,10 @@ class Reader:
         self.rows = {n: mx.load(str(folder / "rows" / f"{n}.slot.safetensors"))["theta"] for n in self.bank}
         # mx.load is lazy and binds to the loading thread's streams; the model owner thread has none of them.
         mx.eval(list(self.rows.values()))
+        # Added to every strength, on the half-step grid: louder delivery, same choices.
+        self.boost = float(os.environ.get("MTPLX_FRANKIE_DELIVERY_BOOST", "0"))
+        if not 0 <= self.boost <= 2 or self.boost * 2 != int(self.boost * 2):
+            raise ValueError("Delivery boost must be 0 to 2 in half steps")
         self.width = int(self.feelings["mu"].shape[-1])
         if self.words["mu"].shape[-1] != self.width:
             raise ValueError("Feeling and word directions read different brain widths")
@@ -93,7 +99,7 @@ class Reader:
         weights = {name: round(x / total, 3) for name, x in kept.items()}
         return dict(weights=weights,
                     rows=sum(x * self.rows[name] for name, x in weights.items()),
-                    strength=float(np.round(np.clip(f @ a["A"], 3, 4) * 2) / 2),
+                    strength=float(np.round(np.clip(f @ a["A"], 3, 4) * 2) / 2) + self.boost,
                     feelings=np.array([round(float(x), 2) for x in zf]))
 
 

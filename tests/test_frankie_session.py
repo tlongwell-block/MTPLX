@@ -763,3 +763,22 @@ def test_resume_does_not_concatenate_different_sample_rates():
         assert not run.merged and len(s.items) == 2
         assert len(s.frames) == 1
     asyncio.run(setup(check))
+
+
+def test_output_rate_is_offered_only_when_the_engine_can_make_it():
+    def update(rate):
+        return {"type": "session.update",
+                "session": {"audio": {"output": {"format": {"type": "audio/pcm", "rate": rate}}}}}
+
+    async def check(s):
+        with pytest.raises(ValueError, match="output rate"):
+            await s.handle(update(48000))
+        assert s.info()["audio"]["output"]["format"]["rate"] == 24000
+        s.engine.output_rates = (24000, 48000)
+        await s.handle(update(48000))
+        assert s.info()["audio"]["output"]["format"]["rate"] == 48000
+        run = Response(id="r", settings=dict(s.settings))
+        s.publish(run, "audio", base64.b64encode(bytes(9600)).decode())  # 100 ms at 48 kHz
+        assert run.emitted_ms == 100
+
+    asyncio.run(setup(check))
