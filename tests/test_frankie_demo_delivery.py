@@ -176,8 +176,8 @@ def test_override_resets_both_lanes_before_the_phrase(assets, tmp_path):
     mouth.guidance = NS(scale=1.0, in_step=lambda: True)
     d._make_guidance = lambda: mouth.guidance
     d.hold.add(12, np.array([0.0, 0.0]))
-    reader.read = lambda mean, n: dict(weights={"sad": 1.0}, rows=mx.zeros((1, 1, 4)), strength=4.0,
-                                       feelings=np.array([9.0, 0.0]))
+    reader.read = lambda mean, n, mood=None: dict(weights={"sad": 1.0}, rows=mx.zeros((1, 1, 4)), strength=4.0,
+                                                  feelings=np.array([9.0, 0.0]), z=np.zeros(5))
     list(mouth.speak("So sorry.", mx.zeros((2, WIDTH))))
     assert resets == [True] and [w for w, _ in d.hold.held] == [2]
     entry = json.loads((tmp_path / "delivery.jsonl").read_text())
@@ -203,3 +203,55 @@ def test_replay_saved_live_phrases_reproduces_every_decision():
         assert read["weights"] == entry.get("weights", entry.get("v9")), n
         assert read["strength"] == entry["strength"], n
         assert read["feelings"].tolist() == entry.get("feelings", entry.get("zf")), n
+
+
+def test_contrast_reads_a_phrase_against_its_reply_mood(assets, monkeypatch):
+    rng = np.random.default_rng(5)
+    mean, mood = rng.normal(size=WIDTH), rng.normal(size=5)  # small enough not to saturate the softmax
+    plain = Reader(assets)
+    assert plain.contrast == 0
+    # Off: a mood changes nothing, exactly.
+    off = plain.read(mean, 5, mood)
+    assert off["weights"] == plain.read(mean, 5)["weights"]
+    monkeypatch.setenv("MTPLX_FRANKIE_DELIVERY_CONTRAST", "0.7")
+    reader = Reader(assets)
+    first, later = reader.read(mean, 5), reader.read(mean, 5, mood)
+    assert first["weights"] == off["weights"]  # a reply's first phrase reads as before
+    shifted = plain.read(mean, 5)["z"] - 0.7 * mood
+    a = reader.adapter
+    logits = np.r_[(shifted - a["mu"]) / a["sd"], 1.0] @ a["W"]
+    p = np.exp(logits - logits.max()); p /= p.sum()
+    kept = {reader.bank[j]: p[j] for j in np.argsort(-p) if p[j] >= 0.05}
+    assert later["weights"] == {k: round(v / sum(kept.values()), 3) for k, v in kept.items()}
+    assert later["weights"] != first["weights"]
+    # Strength and logged feelings never move.
+    assert later["strength"] == first["strength"] and later["feelings"].tolist() == first["feelings"].tolist()
+    for bad in ("-0.1", "1.5"):
+        monkeypatch.setenv("MTPLX_FRANKIE_DELIVERY_CONTRAST", bad)
+        with pytest.raises(ValueError):
+            Reader(assets)
+
+
+def test_reply_mood_is_the_recent_phrases_and_clears_between_replies(assets, tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_FRANKIE_DELIVERY_CONTRAST", "0.5")
+    mouth = Mouth()
+    mouth.model.hold_speech = lambda: None
+    reader = Reader(assets)
+    seen = []
+    original = reader.read
+    reader.read = lambda mean, n, mood=None: (seen.append(None if mood is None else mood.copy()),
+                                              original(mean, n, mood))[1]
+    d = Delivery(mouth, reader)
+    mouth.guidance = NS(scale=1.0, in_step=lambda: True)
+    d._make_guidance = lambda: mouth.guidance
+    rng = np.random.default_rng(6)
+    phrases = [mx.array(rng.normal(size=(3, WIDTH)), dtype=mx.float32) for _ in range(6)]
+    for states in phrases:
+        list(mouth.speak("Hello there.", states))
+    z = [original(np.asarray(mx.mean(s, axis=0)), 3)["z"] for s in phrases]
+    assert seen[0] is None
+    np.testing.assert_allclose(seen[1], z[0], rtol=1e-6)
+    np.testing.assert_allclose(seen[5], np.mean(z[1:5], axis=0), rtol=1e-6)  # the last four phrases
+    mouth.model.hold_speech()  # the engine's call between replies
+    list(mouth.speak("Hi.", phrases[0]))
+    assert seen[6] is None and d.reply_start
