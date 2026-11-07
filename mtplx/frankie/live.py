@@ -51,8 +51,10 @@ DELEGATE = {
 }
 STYLE = ("Everything you say is spoken aloud. Use plain, unformatted conversational "
          "language, and keep replies brief.")
-DELEGATE_GUIDE = ("To delegate to Goose, call the delegate tool. Before the call, briefly say you're on it. "
-                  "When its output arrives, give the user the result in your own words, in one to three "
+DELEGATE_GUIDE = ("Goose, the client, Goose's backend and its tools are all reached the same way: the delegate "
+                  "tool. Any instruction to delegate, hand off, or send work to any of them means calling "
+                  "delegate; saying so out loud does not delegate anything. Before the call, briefly say you're "
+                  "on it. When its output arrives, give the user the result in your own words, in one to three "
                   "spoken sentences. Never read out formatting, code, or long identifiers.")
 FRANKIE = {"background_tasks": True, "playback_feedback": True, "playback_pause": False,
            "backchannels": True}

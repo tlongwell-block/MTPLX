@@ -301,3 +301,9 @@ def test_a_cancelled_setup_frees_the_seat():
             finally:
                 live.LiveSession.open = original
     asyncio.run(main())
+
+
+def test_the_guide_names_every_way_a_client_asks_for_delegation():
+    # Live clients say "delegate to the client" or "to Goose"; either must mean the tool, not a spoken promise.
+    for word in ("Goose", "the client", "calling delegate", "does not delegate anything"):
+        assert word in live.DELEGATE_GUIDE
