@@ -6,11 +6,12 @@ from mtplx.frankie.breeze import BreezeMouth
 
 
 class Boundaries(unittest.TestCase):
-    def test_fast_first_phrase(self):
+    def test_first_phrase_is_the_first_sentence(self):
         self.assertTrue(phrase_complete('Great question!', ' So', first=True))
-        self.assertTrue(phrase_complete('The wire hums a low,', ' electric', first=True))
+        self.assertFalse(phrase_complete('The wire hums a low,', ' electric', first=True))
+        self.assertFalse(phrase_complete('I can hear you', ' loud', first=True, hungry=True))
 
-    def test_continuation_keeps_short_sentences_and_clauses_together(self):
+    def test_continuation_keeps_short_sentences_together(self):
         self.assertFalse(phrase_complete('It twitches.', ' The', first=False))
         self.assertFalse(phrase_complete('The wire hums a low,', ' electric', first=False))
         self.assertTrue(phrase_complete('It twitches. The wire hums a low, electric tune.', ' Below', first=False))
@@ -22,10 +23,18 @@ class Boundaries(unittest.TestCase):
     def test_control_tokens_and_word_limits(self):
         self.assertTrue(phrase_complete('I will check', '<tool_call>', first=True))
         self.assertTrue(phrase_complete('I will check', '<think>', first=False))
-        self.assertFalse(phrase_complete(' '.join(['word']*16), ' next', first=False))
-        self.assertTrue(phrase_complete(' '.join(['word']*32), ' next', first=False))
-        self.assertTrue(phrase_complete(' '.join(['word']*16), ' next', first=True))
+        self.assertFalse(phrase_complete(' '.join(['word']*39) + ',', ' next', first=True))
+        self.assertTrue(phrase_complete(' '.join(['word']*40) + ',', ' next', first=False))
+        self.assertFalse(phrase_complete(' '.join(['word']*63), ' next', first=False))
+        self.assertTrue(phrase_complete(' '.join(['word']*64), ' next', first=True))
         self.assertFalse(phrase_complete('Hello.', 'ing', first=True))
+
+    def test_hungry_mouth_takes_any_sentence_but_never_half_of_one(self):
+        self.assertTrue(phrase_complete('I hear you.', ' That', first=False, hungry=True))
+        self.assertFalse(phrase_complete('I hear you.', ' That', first=False))
+        self.assertFalse(phrase_complete('That kind of tired', ' where', first=False, hungry=True))
+        self.assertFalse(phrase_complete('Going well,', ' thanks', first=False, hungry=True))
+        self.assertFalse(phrase_complete('The Love Song of J.', ' Alfred', first=False, hungry=True))
 
 
 class EmptySpeech(unittest.TestCase):

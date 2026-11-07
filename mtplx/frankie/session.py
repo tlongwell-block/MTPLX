@@ -97,6 +97,9 @@ class Session:
         self.closed = False
         self.tasks = set()
         self.history_prefill_enabled = os.environ.get("MTPLX_FRANKIE_IDLE_HISTORY_PREFILL") == "1"
+        # Silence before a private speculative reply starts. Nothing it makes
+        # is published until the turn is released, and resumed speech drops it.
+        self.speculate_ms = int(os.environ.get("MTPLX_FRANKIE_SPECULATE_MS", "96"))
         self.history_prefill_abort = Event()
         self.history_prefill_revision = 0
         self.history_prefill_key = None
@@ -130,6 +133,7 @@ class Session:
             "context": 131072,
             "tools": [],
             "input_rate": 24000,
+            "output_rate": 24000,
             "background_tasks": False,
             "interruption_policy": "vad",
             "assistant_name": "Frankie",
@@ -225,7 +229,7 @@ class Session:
                     },
                     "turn_detection": self.settings["turn_detection"],
                 },
-                "output": {"format": {"type": "audio/pcm", "rate": 24000}},
+                "output": {"format": {"type": "audio/pcm", "rate": self.settings["output_rate"]}},
             },
             "tools": self.settings["tools"],
         }
@@ -438,7 +442,7 @@ class Session:
             if not run.first_audio_at:
                 run.first_audio_at = time.monotonic()
             raw_size = len(value) // 4 * 3 - (2 if value.endswith("==") else value.endswith("="))
-            run.emitted_ms += raw_size * 1000 / (24000 * 2)
+            run.emitted_ms += raw_size * 1000 / (run.settings.get("output_rate", 24000) * 2)
             self.event("response.output_audio.delta", delta=value, **common)
         elif kind == "text":
             run.text += value
@@ -1412,7 +1416,7 @@ class Session:
                     if semantic_overlap:
                         can_start = False
                     if (
-                        self.silence >= 96
+                        self.silence >= self.speculate_ms
                         and self.spec is None
                         and (not self.prefix_yielded
                              or self.settings["streaming_listener"] == "backchannel")
@@ -1612,6 +1616,12 @@ class Session:
                 if rate not in {16000, 24000}:
                     raise ValueError("PCM input rate must be 16000 or 24000.")
                 new["input_rate"] = rate
+            output = settings.get("audio", {}).get("output", {})
+            if "format" in output:
+                rate = int(output["format"].get("rate", 24000))
+                if rate not in getattr(self.engine, "output_rates", (24000,)):
+                    raise ValueError("Unsupported PCM output rate.")
+                new["output_rate"] = rate
             if new == self.settings:
                 self.event("session.updated", session=self.info())
                 return

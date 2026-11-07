@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from collections import deque
@@ -17,7 +18,7 @@ import numpy as np
 
 from mtplx.engine_session import _bank_bytes_from_env
 from mtplx.features import CommittedFeatures
-from mtplx.generation import generate_ar, generate_mtpk
+from mtplx.generation import PostcommitAbort, generate_ar, generate_mtpk
 from mtplx.runtime import load
 from mtplx.sampling import SamplerConfig
 from mtplx.session_bank import SessionBank
@@ -298,7 +299,8 @@ class Frankie:
         if len(ids) + settings["max_output_tokens"] > settings.get("context", 131072):
             raise ValueError("Conversation exceeds the configured context limit.")
         history_prefill = None
-        if self.bank is not None:
+        reply_warm = os.environ.get("MTPLX_FRANKIE_REPLY_WARM", "1") == "1"
+        if self.bank is not None and not (reply_warm and "audio" in settings["output_modalities"]):
             # The open thinking header changes when this becomes public history.
             # Bank the closed history instead, so the next turn can reuse every
             # completed audio span without restoring across a rewritten header.
@@ -403,7 +405,9 @@ class Frankie:
             if not mouth_enabled or not speech_ids or in_thinking or in_tool:
                 return False
             current = self.tokenizer.decode(speech_ids).strip()
-            if phrase_complete(current, value, first=speech_chunks == 0):
+            # Breeze speaks at about real time, so an idle mouth only loses lead.
+            hungry = speaker is None and not pending and audio_start is not None
+            if phrase_complete(current, value, first=speech_chunks == 0, hungry=hungry):
                 chunk()
                 return True
             return False
@@ -535,6 +539,27 @@ class Frankie:
                     all_text += tail
                     emit("text", tail)
                 chunk()
+                if (self.bank is not None and audio_start is not None and all_text.strip()
+                        and not native_tools and not in_thinking and not in_tool
+                        and reply_warm):
+                    # The brain finishes long before the mouth. Bank the
+                    # history the next turn will render while this reply
+                    # plays: warm checks in between 32-token chunks, and each
+                    # check refills the mouth first. This replaces banking
+                    # the closed history before generation, on the critical
+                    # path: the next turn restores from here, and a reply cut
+                    # short restores from the turn before and prefills more.
+                    def pump():
+                        step_audio()
+                        return abort.is_set()
+
+                    reply = {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_audio", "transcript": all_text}]}
+                    try:
+                        self.warm(settings, session_id=session_id, history=[*items, reply],
+                                  abort_check=pump, prefill_step_size=lambda: 32)
+                    except PostcommitAbort:
+                        pass
                 step_audio(force=True)
             stats = result.stats.to_dict()
             if history_prefill is not None:

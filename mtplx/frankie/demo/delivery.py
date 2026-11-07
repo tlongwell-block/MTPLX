@@ -5,12 +5,20 @@ mean is read against fixed directions (16 feelings, 24 words), each reading
 scored against phrases of the same length, so a short "Hey there!" does not
 read as the most excited thing ever said. A small adapter maps the 40
 readings to weights over learned Breeze instruction row sets and to a
-guidance strength (3, 3.5 or 4: every new scale costs Breeze a recompile).
+guidance strength (3, 3.5 or 4, raised by MTPLX_FRANKIE_DELIVERY_BOOST: every
+new scale costs Breeze a recompile).
 The weighted rows take the instruction's place in Breeze's prompt, and paired
 guidance (guidance.py) pushes toward them. No sentence is ever written.
 
 A brain other than the one the directions were fitted on (27B) carries a
 ``flash-scale.npz`` that maps its readings onto the scale the adapter expects.
+
+A long reply carries one mood in every phrase's state (a sad story reads sad
+throughout), which drowns out the phrase's own turn. With
+MTPLX_FRANKIE_DELIVERY_CONTRAST at c > 0, the rows are chosen from each
+reading minus c times the mean of the reply's previous MOOD_PHRASES readings;
+the reply's first phrase, the strength and the feeling log read as before.
+0, the default, is the old reading exactly.
 
 With held speech on (MTPLX_FRANKIE_SPEECH_HOLD_WORDS), Breeze keeps Frankie's
 newest phrases from one reply to the next so he stays one speaker; an extreme
@@ -25,6 +33,7 @@ from collections import deque
 from contextvars import ContextVar
 import functools
 import json
+import os
 from pathlib import Path
 import time
 
@@ -33,6 +42,7 @@ import numpy as np
 PLAIN = "Speak clearly and naturally."
 LEARNED = "Speak with the learned delivery."
 SAMPLE_RATE = 24000
+MOOD_PHRASES = 4  # how far back a reply's mood reaches
 
 
 def calibrated(d, cal, n):
@@ -69,21 +79,32 @@ class Reader:
         self.axes = [str(x) for x in self.feelings["axes"]]
         self.bank = [str(x) for x in self.adapter["bank"]]
         self.rows = {n: mx.load(str(folder / "rows" / f"{n}.slot.safetensors"))["theta"] for n in self.bank}
+        # mx.load is lazy and binds to the loading thread's streams; the model owner thread has none of them.
+        mx.eval(list(self.rows.values()))
+        # Added to every strength, on the half-step grid: louder delivery, same choices.
+        self.boost = float(os.environ.get("MTPLX_FRANKIE_DELIVERY_BOOST", "0"))
+        if not 0 <= self.boost <= 2 or self.boost * 2 != int(self.boost * 2):
+            raise ValueError("Delivery boost must be 0 to 2 in half steps")
+        self.contrast = float(os.environ.get("MTPLX_FRANKIE_DELIVERY_CONTRAST", "0"))
+        if not 0 <= self.contrast <= 1:
+            raise ValueError("Delivery contrast must be 0 to 1")
         self.width = int(self.feelings["mu"].shape[-1])
         if self.words["mu"].shape[-1] != self.width:
             raise ValueError("Feeling and word directions read different brain widths")
 
-    def read(self, mean, n):
-        """mean: the phrase's brain states averaged over its n rows."""
+    def read(self, mean, n, mood=None):
+        """mean: the phrase's brain states averaged over its n rows; mood: the
+        reply's mean earlier ``z``, or None at a reply's first phrase."""
         zf = readings(calibrated(self.feelings, self.feelings_cal, n), mean)
         zw = readings(calibrated(self.words, self.words_cal, n), mean)
         if self.scale is not None:
             s = self.scale
             zf = s["fa"] + (zf - s["fc"]) / s["fe"] * s["fb"]
             zw = s["wa"] + (zw - s["wc"]) / s["we"] * s["wb"]
-        a = self.adapter
-        f = np.r_[(np.r_[zf, zw] - a["mu"]) / a["sd"], 1.0]
-        logits = f @ a["W"]
+        a, z = self.adapter, np.r_[zf, zw]
+        f = np.r_[(z - a["mu"]) / a["sd"], 1.0]
+        moment = f if mood is None or not self.contrast else np.r_[(z - self.contrast * mood - a["mu"]) / a["sd"], 1.0]
+        logits = moment @ a["W"]
         p = np.exp(logits - logits.max())
         p /= p.sum()
         kept = {self.bank[j]: float(p[j]) for j in np.argsort(-p) if p[j] >= 0.05}
@@ -91,8 +112,8 @@ class Reader:
         weights = {name: round(x / total, 3) for name, x in kept.items()}
         return dict(weights=weights,
                     rows=sum(x * self.rows[name] for name, x in weights.items()),
-                    strength=float(np.round(np.clip(f @ a["A"], 3, 4) * 2) / 2),
-                    feelings=np.array([round(float(x), 2) for x in zf]))
+                    strength=float(np.round(np.clip(f @ a["A"], 3, 4) * 2) / 2) + self.boost,
+                    feelings=np.array([round(float(x), 2) for x in zf]), z=z)
 
 
 class Hold:
@@ -154,12 +175,14 @@ class Delivery:
             model, lambda *a, **k: upstream(*a, repetition_penalty=penalty, **k),
             build_paired_depth(model)).install()
         self.hold, self.reply_start = (Hold() if model.hold_words else None), False
-        if self.hold is not None:
+        self.mood = deque(maxlen=MOOD_PHRASES)  # this reply's earlier readings
+        if self.hold is not None or reader.contrast:
             hold_speech = model.hold_speech
 
-            def held():
+            def held():  # the engine's call between replies
                 hold_speech()
                 self.reply_start = True
+                self.mood.clear()
             model.hold_speech = held
         self._speak = mouth.speak
         self._inside = ContextVar("brain_led_inside", default=False)
@@ -177,7 +200,9 @@ class Delivery:
         row = why = None
         if getattr(states, "ndim", 0) == 2 and len(states) and states.shape[1] == self.reader.width:
             import mlx.core as mx
-            row = self.reader.read(np.asarray(mx.mean(states.astype(mx.float32), axis=0)), len(states))
+            mood = np.mean(self.mood, axis=0) if self.mood else None
+            row = self.reader.read(np.asarray(mx.mean(states.astype(mx.float32), axis=0)), len(states), mood)
+            self.mood.append(row["z"])
             if self.hold is not None:
                 why = self._override(row["feelings"], len(text.split()))
         led = g.in_step()

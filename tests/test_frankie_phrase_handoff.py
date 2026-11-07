@@ -14,12 +14,12 @@ mx = pytest.importorskip("mlx.core")
     "phrase,following,early",
     [
         ("Hello.", " Welcome.", True),
-        ("Here are four words,", " and more.", True),
+        ("Here are four words,", " and more.", False),
         ("Hi,", " there.", False),
         ("The value is 3.", "14", False),
         ("Let me check.", "<tool_call>", True),
         ("Let me check.", "<think>", True),
-        ("word " * 15 + "word", " next.", True),
+        ("word " * 63 + "word", " next.", True),
     ],
 )
 def test_committed_boundary_keeps_exact_phrase_features(
