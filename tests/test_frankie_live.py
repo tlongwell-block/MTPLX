@@ -194,7 +194,7 @@ def test_separate_user_turns_stay_separate_words():
 def test_mute_close_and_bad_events_answer_their_client_event():
     async def check(s, ws, engine):
         await ws.inbox.put({"type": "session.input_audio.mute", "event_id": "m1"})
-        await ws.inbox.put({"type": "session.thinking.append", "event_id": "t1", "content": "x"})
+        await ws.inbox.put({"type": "session.input_audio.append", "event_id": "t1", "audio": "AAAA"})
         await until(lambda: ws.of("error"))
         assert ws.of("session.input_audio.muted")[0]["client_event_id"] == "m1" and s.muted
         assert ws.of("error")[0]["error"]["client_event_id"] == "t1"
@@ -241,3 +241,63 @@ def test_speaker_plays_listening_sounds_only_between_replies():
     speaker.audio("r1", "i1", np.ones(24 * 200, np.int16))
     speaker.backchannel("bc2", np.full(480, 7, np.int16))
     assert not any((f == 7).any() for f in frames(speaker, 12))
+
+
+def test_a_sideband_that_fails_to_accept_still_frees_the_seat():
+    async def main():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ended = []
+            s = live.LiveSession(Engine(), executor, None, ended.append)
+            await s.configure(live.parse(body())[0])
+            ws = Socket()
+
+            async def broken():
+                raise RuntimeError("handshake failed")
+            ws.accept = broken
+            await s.attach(ws)
+            assert s.closed and ended == [s]
+    asyncio.run(main())
+
+
+def test_instructions_and_thinking_are_acknowledged_context_for_the_next_turn():
+    async def check(s, ws, engine):
+        await ws.inbox.put({"type": "session.instructions.append", "event_id": "i1", "content": "Be brief."})
+        await ws.inbox.put({"type": "session.thinking.append", "event_id": "t1", "content": "Checking disk."})
+        await ws.inbox.put({"type": "session.instructions.append", "event_id": "i2", "delegation_id": "dlg_x",
+                            "content": "x"})
+        await until(lambda: ws.of("session.thinking.appended") and ws.of("error"))
+        assert ws.of("session.instructions.appended")[0]["client_event_id"] == "i1"
+        assert ws.of("session.thinking.appended")[0]["client_event_id"] == "t1"
+        assert ws.of("error")[0]["error"]["client_event_id"] == "i2"
+        revision, text = s.session.latest_context
+        assert revision == 2 and "Be brief." in text and "Checking disk." in text
+        assert not ws.of("session.output_transcript.delta") and not engine.calls  # Nothing is spoken.
+    run(check)
+
+
+def test_a_cancelled_setup_frees_the_seat():
+    async def main():
+        from fastapi import FastAPI
+        app, seat, engine = FastAPI(), NS(owner=None), Engine()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            live.attach_routes(app, "tok", seat, lambda: engine, executor, lambda: None)
+            create = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/v1/live/sessions")
+            opened = asyncio.Event()
+
+            async def stalled(self, session, offer):
+                opened.set()
+                await asyncio.sleep(60)
+            original, live.LiveSession.open = live.LiveSession.open, stalled
+            try:
+                request = NS(headers={"authorization": "Bearer tok"},
+                             body=lambda: asyncio.sleep(0, json.dumps(body()).encode()))
+                task = asyncio.create_task(create(request))
+                await opened.wait()
+                assert seat.owner is not None
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert seat.owner is None
+            finally:
+                live.LiveSession.open = original
+    asyncio.run(main())

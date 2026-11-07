@@ -33,6 +33,7 @@ MAX_BODY_BYTES = 1 << 20
 MAX_SDP_BYTES = 64 * 1024
 MAX_INPUT_MESSAGES = 128
 MAX_COMMENTARY_BYTES = 64 * 1024
+MAX_CONTEXT_BYTES = 16384  # Frankie's input context limit.
 MAX_PENDING_EVENTS = 256
 SETUP_TIMEOUT_S = 9  # goose gives signaling 10 s.
 ATTACH_TIMEOUT_S = 15
@@ -56,6 +57,9 @@ DELEGATE_GUIDE = ("To delegate to Goose, call the delegate tool. Before the call
 FRANKIE = {"background_tasks": True, "playback_feedback": True, "playback_pause": False,
            "backchannels": True}
 LISTENER = {"interruption_policy": "semantic", "streaming_listener": "backchannel"}
+CONTEXT_CHANNELS = {f"session.{c}.append": c for c in ("instructions", "thinking", "commentary")}
+CONTEXT_LABELS = {"instructions": "Instructions from Goose", "thinking": "Goose is thinking",
+                  "commentary": "Note from Goose"}
 ROLES = {"user": ("user", "input_text"), "assistant": ("assistant", "output_text"),
          "developer": ("system", "input_text")}
 
@@ -266,6 +270,7 @@ class LiveSession:
         self.pending, self.tasks = deque(), set()
         self.delegations = {}  # Open delegation id -> Frankie call id.
         self.offset, self.last_speaker = 0, None
+        self.context, self.context_revision = [], 0
         self.muted = self.closed = self.attached = False
 
     def spawn(self, coro):
@@ -319,18 +324,18 @@ class LiveSession:
 
     async def pump(self):
         while True:
-            event, client_event_id = await self.inbox.get()
+            event, ack = await self.inbox.get()
             try:
                 await self.session.handle(event)
             except (ValueError, KeyError, TypeError, RuntimeError) as exc:
-                if client_event_id:
-                    await self.error(client_event_id, "invalid_request", str(exc))
+                if ack:
+                    await self.error(ack[0], "invalid_request", str(exc))
                 else:
                     print(f"Live session {self.id}: {type(exc).__name__}: {exc}", flush=True)
             else:
-                if client_event_id:
+                if ack:
                     clock = int(self.session.clock_ms)
-                    await self.emit("session.commentary.appended", client_event_id=client_event_id,
+                    await self.emit(f"session.{ack[1]}.appended", client_event_id=ack[0],
                                     start_ms=clock, end_ms=clock)
 
     async def listen(self, track):
@@ -406,18 +411,34 @@ class LiveSession:
             self.muted = kind.endswith(".mute")
             return await self.emit("session.input_audio." + ("muted" if self.muted else "unmuted"),
                                    client_event_id=event_id)
-        if kind != "session.commentary.append":
+        channel = CONTEXT_CHANNELS.get(kind)
+        if channel is None:
             return await self.error(event_id, "unsupported_event", f"Frankie does not accept {kind}.")
         content = message.get("content")
         if not isinstance(content, str) or len(content.encode()) > MAX_COMMENTARY_BYTES:
-            return await self.error(event_id, "invalid_request", "Commentary content must be text under 64 KiB.")
-        # One result per delegation: an unknown, answered or closed id is refused, never spoken.
-        call_id = self.delegations.pop(message.get("delegation_id"), None)
-        if call_id is None:
-            return await self.error(event_id, "unknown_delegation", "Commentary needs an open delegation_id.")
-        await self.inbox.put(({"type": "conversation.item.create", "item": {
-            "type": "function_call_output", "call_id": call_id, "output": content}}, event_id))
-        await self.inbox.put(({"type": "response.create"}, None))
+            return await self.error(event_id, "invalid_request", "Context content must be text under 64 KiB.")
+        delegation_id = message.get("delegation_id")
+        if channel == "commentary" and delegation_id is not None:
+            # One result per delegation: an unknown, answered or closed id is refused, never spoken.
+            call_id = self.delegations.pop(delegation_id, None)
+            if call_id is None:
+                return await self.error(event_id, "unknown_delegation", "Commentary needs an open delegation_id.")
+            await self.inbox.put(({"type": "conversation.item.create", "item": {
+                "type": "function_call_output", "call_id": call_id, "output": content}}, (event_id, channel)))
+            await self.inbox.put(({"type": "response.create"}, None))
+            return
+        if delegation_id is not None:
+            return await self.error(event_id, "invalid_request", "Only commentary belongs to a delegation.")
+        # Context, not a request: it rides along with the user's next turn, and nothing is spoken now.
+        self.context.append(f"{CONTEXT_LABELS[channel]}: {content.strip()}")
+        text = "\n".join(self.context)
+        while len(text.encode()) > MAX_CONTEXT_BYTES and len(self.context) > 1:
+            self.context.pop(0)
+            text = "\n".join(self.context)
+        self.context_revision += 1
+        await self.inbox.put(({"type": "frankie.input_context.update", "revision": self.context_revision,
+                               "text": text.encode()[:MAX_CONTEXT_BYTES].decode(errors="ignore")},
+                              (event_id, channel)))
 
     async def emit(self, kind, **data):
         event = {"type": kind, "event_id": identifier("evt"), **data}
@@ -441,8 +462,8 @@ class LiveSession:
             return
         self.attached = True
         self.tasks.add(asyncio.current_task())  # Closing elsewhere ends this receive loop too.
-        await ws.accept()
         try:
+            await ws.accept()
             # Events raised meanwhile queue behind these, so the client sees them in order.
             await ws.send_json({"type": "session.started", "event_id": identifier("evt"),
                                 "session": {"id": self.id}})
@@ -535,6 +556,9 @@ def attach_routes(app, token, seat, get_engine, executor, listener_service):
         seat.owner = sessions[live.id] = live
         try:
             answer = await asyncio.wait_for(live.open(session, offer), SETUP_TIMEOUT_S)
+        except asyncio.CancelledError:
+            await asyncio.shield(live.close("setup_cancelled"))
+            raise
         except Exception as exc:
             await live.close("setup_failed")
             if isinstance(exc, ValueError):
