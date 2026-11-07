@@ -70,7 +70,7 @@ def serve(args):
     residency = SimpleNamespace(model_scheduler=executor, metal_memory_caps={},
                                 gpu_keepalive={}, previous_limits={}, failure=None)
     residency_started = False
-    owner = None
+    seat = SimpleNamespace(owner=None)  # Frankie holds one conversation, realtime or live.
     engine = None
 
     @asynccontextmanager
@@ -138,8 +138,8 @@ def serve(args):
             yield
         finally:
             try:
-                if owner is not None:
-                    await owner.close()
+                if seat.owner is not None:
+                    await seat.owner.close()
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
 
@@ -214,9 +214,17 @@ def serve(args):
             Path(__file__).with_name("audio-worklet.mjs"), media_type="text/javascript"
         )
 
+    # GPT-Live sessions have their own token, so a client of them never holds the page's.
+    live_token = os.environ.get("MTPLX_FRANKIE_LIVE_TOKEN")
+    if live_token:
+        if hmac.compare_digest(live_token, token):
+            raise ValueError("MTPLX_FRANKIE_LIVE_TOKEN must differ from MTPLX_FRANKIE_TOKEN.")
+        from . import live  # Needs aiortc; /v1/realtime does not.
+        live.attach_routes(app, live_token, seat, lambda: engine and get_engine(), executor,
+                           completion_service)
+
     @app.websocket("/v1/realtime")
     async def realtime(ws: WebSocket):
-        nonlocal owner
         auth = ws.headers.get("authorization", "").removeprefix("Bearer ")
         protocols = ws.headers.get("sec-websocket-protocol", "").split(",")
         for value in protocols:
@@ -226,13 +234,13 @@ def serve(args):
         if not hmac.compare_digest(auth, token):
             await ws.close(code=1008, reason="Invalid access token.")
             return
-        if owner is not None:
+        if seat.owner is not None:
             await ws.close(code=1013, reason="Another conversation owns Frankie.")
             return
         session = Session(engine, executor, ws)
         from .perception import RealtimeListener
         session.listener = RealtimeListener(session, completion_service())
-        owner = session
+        seat.owner = session
         sender = None
         try:
             await ws.accept(
@@ -265,8 +273,8 @@ def serve(args):
             if sender is not None:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
-            if owner is session:
-                owner = None
+            if seat.owner is session:
+                seat.owner = None
 
     uvicorn.run(
         app,
